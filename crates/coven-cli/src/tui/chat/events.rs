@@ -8,19 +8,52 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{backend::CrosstermBackend, Terminal};
 
+#[cfg(test)]
+use super::app::CHAT_TICK_INTERVAL;
 use super::app::{App, InputMode, InterruptOutcome, SlashCommandResult};
 use super::render::render_ui;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalWait {
+    Blocking,
+    Timed(Duration),
+}
+
+fn next_terminal_wait(tick_timeout: Option<Duration>) -> TerminalWait {
+    match tick_timeout {
+        Some(timeout) => TerminalWait::Timed(timeout),
+        None => TerminalWait::Blocking,
+    }
+}
+
+fn read_terminal_event(wait: TerminalWait) -> Result<Option<Event>> {
+    match wait {
+        TerminalWait::Blocking => Ok(Some(event::read()?)),
+        TerminalWait::Timed(timeout) if event::poll(timeout)? => Ok(Some(event::read()?)),
+        TerminalWait::Timed(_) => Ok(None),
+    }
+}
+
+fn terminal_event_requests_redraw(input_event: &Event) -> bool {
+    !matches!(input_event, Event::Key(key) if key.kind != KeyEventKind::Press)
+}
 
 pub(super) fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
 ) -> Result<()> {
+    let mut needs_redraw = true;
     loop {
-        terminal.draw(|f| render_ui(f, app))?;
+        if needs_redraw {
+            terminal.draw(|f| render_ui(f, app))?;
+            needs_redraw = false;
+        }
 
-        // Poll with timeout for spinner animation
-        if event::poll(Duration::from_millis(100))? {
-            match event::read()? {
+        if let Some(input_event) = read_terminal_event(next_terminal_wait(app.tick_timeout()))? {
+            if terminal_event_requests_redraw(&input_event) {
+                needs_redraw = true;
+            }
+            match input_event {
                 Event::Key(key) => {
                     if key.kind != KeyEventKind::Press {
                         continue;
@@ -227,7 +260,9 @@ pub(super) fn run_event_loop(
             }
         }
 
-        app.tick();
+        if app.tick() {
+            needs_redraw = true;
+        }
     }
 }
 
@@ -240,10 +275,14 @@ struct ScheduleMetrics {
 
 #[cfg(test)]
 fn schedule_metrics(duration_ms: u64, streaming: bool) -> ScheduleMetrics {
-    let polls = duration_ms / 100;
+    let polls = if streaming {
+        duration_ms / CHAT_TICK_INTERVAL.as_millis() as u64
+    } else {
+        0
+    };
     ScheduleMetrics {
-        // The current loop draws once before its first poll, then once at the
-        // top of each subsequent poll cycle.
+        // Idle mode renders only the initial frame. Streaming renders that
+        // frame plus one spinner/session-update frame per tick.
         draws: polls + 1,
         polls,
         streaming,
@@ -255,11 +294,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn schedule_metrics_model_the_current_draw_before_poll_loop() {
+    fn next_terminal_wait_blocks_when_app_has_no_tick_deadline() {
+        assert_eq!(next_terminal_wait(None), TerminalWait::Blocking);
+    }
+
+    #[test]
+    fn next_terminal_wait_uses_the_remaining_active_tick_budget() {
+        assert_eq!(
+            next_terminal_wait(Some(Duration::from_millis(37))),
+            TerminalWait::Timed(Duration::from_millis(37))
+        );
+    }
+
+    #[test]
+    fn ignored_key_events_do_not_request_a_redraw() {
+        let release = Event::Key(crossterm::event::KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+            KeyEventKind::Release,
+        ));
+        let repeat = Event::Key(crossterm::event::KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+            KeyEventKind::Repeat,
+        ));
+        let press = Event::Key(crossterm::event::KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+            KeyEventKind::Press,
+        ));
+
+        assert!(!terminal_event_requests_redraw(&release));
+        assert!(!terminal_event_requests_redraw(&repeat));
+        assert!(terminal_event_requests_redraw(&press));
+    }
+
+    #[test]
+    fn schedule_metrics_model_idle_blocking_and_active_tick_cadence() {
         let idle = schedule_metrics(10_000, false);
-        assert_eq!(idle.polls, 100);
-        assert_eq!(idle.draws, 101);
+        assert_eq!((idle.draws, idle.polls), (1, 0));
         assert!(!idle.streaming);
+
+        let streaming = schedule_metrics(10_000, true);
+        assert_eq!((streaming.draws, streaming.polls), (84, 83));
+        assert!(streaming.streaming);
     }
 
     #[test]
