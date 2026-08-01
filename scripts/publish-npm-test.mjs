@@ -18,11 +18,45 @@ import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { defaultTargetName, isMainModule, isOidcContext, packageVersionPublished, publishArgs, publishEnv, releaseVersion, targetPackageName, validatePublishToken, validatePublishVersion, wrapperPackageDirName, wrapperPackageNameList, wrapperTextForPackage } from './publish-npm.mjs';
+import { parseReleaseTag } from './release-npm-context.mjs';
 
 const OIDC_ENV = {
   ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'fake-oidc-token',
   ACTIONS_ID_TOKEN_REQUEST_URL: 'https://token.actions.githubusercontent.com/'
 };
+
+test('parseReleaseTag preserves stable releases', () => {
+  assert.deepEqual(parseReleaseTag('v0.2.3'), {
+    releaseMode: 'normal',
+    releaseTag: 'v0.2.3',
+    npmVersion: '0.2.3',
+    recoveryAttempt: null
+  });
+});
+
+test('parseReleaseTag derives the base version from signed recovery tags', () => {
+  assert.deepEqual(parseReleaseTag('v0.2.3-recovery.1'), {
+    releaseMode: 'recovery',
+    releaseTag: 'v0.2.3',
+    npmVersion: '0.2.3',
+    recoveryAttempt: 1
+  });
+});
+
+test('parseReleaseTag rejects malformed and unrelated prerelease tags', () => {
+  for (const tag of [
+    'v0.2',
+    'v0.2.3-rc.1',
+    'v0.2.3-recovery.0',
+    'v01.2.3',
+    'recovery-v0.2.3'
+  ]) {
+    assert.throws(
+      () => parseReleaseTag(tag),
+      /stable vX.Y.Z tag or vX.Y.Z-recovery.N/
+    );
+  }
+});
 
 const SIGNAL_TEST_PACKAGES = {
   'darwin-arm64': ['@opencoven/cli-macos', 'coven'],
@@ -624,6 +658,105 @@ test('release workflow verifies the signed release tag before building or publis
   );
 });
 
+test('release workflow fail-closes signed recovery tags', () => {
+  const workflowPath = new URL(
+    ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
+    import.meta.url
+  );
+  const workflow = readFileSync(workflowPath, 'utf8');
+
+  assert.match(
+    workflow,
+    /node scripts\/release-npm-context\.mjs "\$GITHUB_REF_NAME"/,
+    'workflow must derive stable release context from the pushed signed tag'
+  );
+  assert.match(
+    workflow,
+    /outputs:[\s\S]*release_mode:[\s\S]*release_tag:[\s\S]*npm_version:/,
+    'verify-tag must expose validated release context to downstream jobs'
+  );
+  assert.match(
+    workflow,
+    /git verify-tag "\$RELEASE_TAG"/,
+    'recovery must locally verify the original stable release tag'
+  );
+  assert.match(
+    workflow,
+    /BASE_TAG_PAYLOAD=.*gh api/,
+    'recovery must query GitHub verification for the original release tag'
+  );
+  assert.match(
+    workflow,
+    /BASE_OBJECT_TYPE.*commit/s,
+    'recovery must reject a base tag that does not target a commit'
+  );
+  assert.match(
+    workflow,
+    /git merge-base --is-ancestor "\$BASE_COMMIT_SHA" "\$TAGGED_COMMIT_SHA"/,
+    'recovery tag must descend from the stable release tag'
+  );
+  assert.match(
+    workflow,
+    /git diff --name-only "\$BASE_COMMIT_SHA\.\.\$TAGGED_COMMIT_SHA"/,
+    'recovery must inspect every changed path after the stable release'
+  );
+  assert.match(
+    workflow,
+    /Refusing recovery: changed path/,
+    'recovery must fail closed on product or package drift'
+  );
+});
+
+test('release workflow publishes only missing packages during recovery', () => {
+  const workflowPath = new URL(
+    ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
+    import.meta.url
+  );
+  const workflow = readFileSync(workflowPath, 'utf8');
+  const publish = workflow.slice(workflow.indexOf('  npm-publish:'));
+
+  assert.match(workflow, /npm-dry-run:[\s\S]*?needs: \[build-platform, verify-tag\]/);
+  assert.match(
+    publish,
+    /needs: \[build-platform, npm-dry-run, verify-tag\]/,
+    'publish job must consume verified release context'
+  );
+  assert.match(
+    publish,
+    /name: Confirm expected partial npm state[\s\S]*@opencoven\/cli-linux-x64[\s\S]*@opencoven\/cli-windows[\s\S]*@opencoven\/cli-macos[\s\S]*@opencoven\/cli/,
+    'recovery must prove the exact two-published, two-missing package state'
+  );
+  assert.match(
+    publish,
+    /Could not prove \$package_name@\$NPM_VERSION is absent/,
+    'registry errors other than E404 must fail closed'
+  );
+  assert.match(
+    publish,
+    /--target=linux-x64 --skip-build --publish --skip-wrapper\s*\n\s*if: needs\.verify-tag\.outputs\.release_mode == 'normal'/,
+    'Linux publication must run only for normal releases'
+  );
+  assert.match(
+    publish,
+    /--target=windows --skip-build --publish --skip-wrapper\s*\n\s*if: needs\.verify-tag\.outputs\.release_mode == 'normal'/,
+    'Windows publication must run only for normal releases'
+  );
+  assert.match(
+    publish,
+    /--target=macos --skip-build --publish\s*\n\s*env:/,
+    'macOS plus wrapper publication must run in normal and recovery modes'
+  );
+  assert.doesNotMatch(
+    workflow,
+    /COVEN_NPM_VERSION: \$\{\{ github\.ref_name \}\}/,
+    'publication must use the base npm version derived from verified tag context'
+  );
+  assert.match(
+    workflow,
+    /COVEN_NPM_VERSION: \$\{\{ needs\.verify-tag\.outputs\.npm_version \}\}/
+  );
+});
+
 test('release workflow triggers only on signed v* tag pushes (no workflow_dispatch fallback)', () => {
   const workflowPath = new URL(
     ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
@@ -666,6 +799,21 @@ test('release workflow concurrency keeps overlapping releases from interleaving'
   const workflow = readFileSync(workflowPath, 'utf8');
   assert.match(workflow, /^concurrency:\s*\n\s*group:\s*release-npm/m);
   assert.match(workflow, /cancel-in-progress:\s*false/);
+});
+
+test('releasing guide documents signed partial-publish recovery', () => {
+  const guide = readFileSync(
+    new URL(['..', 'docs', 'reference', 'releasing.md'].join('/'), import.meta.url),
+    'utf8'
+  );
+
+  assert.match(guide, /vX\.Y\.Z-recovery\.N/);
+  assert.match(guide, /new signed recovery tag/i);
+  assert.match(guide, /original release tag is an ancestor/i);
+  assert.match(guide, /never move or reuse/i);
+  assert.match(guide, /@opencoven\/cli-linux-x64[\s\S]*@opencoven\/cli-windows/);
+  assert.match(guide, /@opencoven\/cli-macos[\s\S]*@opencoven\/cli/);
+  assert.match(guide, /npm trust github/);
 });
 
 test('secret guard unit tests run in local and tag-driven release gates', () => {
