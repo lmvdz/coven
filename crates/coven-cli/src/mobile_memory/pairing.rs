@@ -460,9 +460,10 @@ mod tests {
         }
 
         fn enroll_after_expiry(&self) -> Result<EnrolledPairing, PairingError> {
+            let nonce = random::<[u8; 32]>();
             self.manager.enroll(
                 self.pairing_id,
-                self.pairing_nonce,
+                nonce,
                 self.request.clone(),
                 [3; 32],
                 self.now + Duration::minutes(6),
