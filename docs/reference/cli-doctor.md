@@ -16,6 +16,11 @@ coven doctor
 The command is read-only. It prints local setup state and a next step without
 starting a session.
 
+The prose report uses `[OK]` for passing checks, `[--]` for advisory warnings,
+and `[!!]` only for blocking failures. It is line-oriented plain text and does
+not emit or pass through ANSI escape sequences, including when global color is
+forced or configuration text contains terminal controls.
+
 ## Machine-readable output
 
 `coven doctor --json` emits one JSON document for scripts and CI gates, with
@@ -31,7 +36,7 @@ found):
   "checks": [
     { "id": "daemon", "status": "pass", "message": "running (pid 12345, socket <daemon-socket>)" },
     { "id": "harness:codex", "status": "pass", "message": "`codex` is ready (built-in)" },
-    { "id": "harnesses", "status": "pass", "message": "1 of 3 configured harnesses available" },
+    { "id": "harnesses", "status": "pass", "message": "2 of 4 configured harnesses available" },
     { "id": "engine", "status": "pass", "message": "<engine> (managed install), version 0.6.1 (pin 0.6.1)" }
   ],
   "nextSteps": ["coven run codex \"explain this repo in 5 bullets\"", "coven sessions"]
@@ -67,7 +72,9 @@ availability, where any missing adapter is a `fail`.
 | `Daemon` | Whether the background daemon is stopped, running, or stale. |
 | `Repos` | Configured repositories from Coven repo settings, if present. |
 | `Harnesses` | Supported harness executables that are visible on this shell's `PATH`. |
+| `Engine` | Whether the Coven engine is installed and meets the minimum supported version. |
 | `Familiars` | Configured familiar identities from `familiars.toml`, if present. |
+| `Credentials` | Local engine authentication state and setup hints; external harness provider turns are not performed. |
 | `Next steps` | The safest next command based on the detected state. |
 
 ## Expected first-run loop
@@ -145,10 +152,11 @@ blocking problem:
 - the daemon is stale (`running` and `stopped` are both healthy states)
 - a registered repo entry points at a missing or non-git path
 - `coven-code` is missing
+- the installed `coven-code` version is older than the supported minimum
 
-A missing harness prints a `[!!]` line with an install hint but does not fail
-the check while another harness is available — one working harness makes Coven
-usable.
+Each missing harness prints an advisory `[--]` line with an install hint. When
+none is available, Doctor adds a blocking `[!!] No supported harness is
+available` line and exits 1; one working harness keeps the aggregate usable.
 
 `coven adapter doctor` is stricter about its own subject: it exits `1` if any
 listed adapter is unavailable. `coven wt --doctor` exits `1` when managed hooks
