@@ -19,8 +19,9 @@ use serde_json::{json, Value};
 use url::Url;
 
 use crate::{
-    delegation, delegation_cleanup, delegation_executor, executor_node, fleet, harness_host,
-    session_roam_executor, workspace_mobility,
+    delegation, delegation_cleanup, delegation_executor,
+    executor_control::{self, DesiredState, ExecutorOwner, RuntimeState},
+    executor_node, fleet, harness_host, session_roam_executor, workspace_mobility,
 };
 
 const CONFIG_FILE: &str = "fleet-executor.json";
@@ -329,6 +330,8 @@ fn run_once(
         config,
         workspace_binary,
         Duration::from_secs(10),
+        25,
+        || Ok(()),
     )
 }
 
@@ -338,6 +341,8 @@ fn run_once_with_renewal_interval(
     config: &ExecutorFleetConfig,
     workspace_binary: Option<&OsStr>,
     renewal_interval: Duration,
+    claim_wait_seconds: u8,
+    on_claimed: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     let epoch = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
     checked_response(
@@ -355,7 +360,10 @@ fn run_once_with_renewal_interval(
     )?;
     let claim = checked_response(
         transport.post(
-            &format!("/api/v1/fleet/nodes/{}/jobs/claim?wait=25", config.node_id),
+            &format!(
+                "/api/v1/fleet/nodes/{}/jobs/claim?wait={claim_wait_seconds}",
+                config.node_id
+            ),
             Some(&config.node_secret),
             &json!({}),
         )?,
@@ -365,6 +373,7 @@ fn run_once_with_renewal_interval(
     if claim.is_null() {
         return Ok(());
     }
+    on_claimed()?;
     let job = &claim["job"];
     let job_id = job["jobId"].as_str().context("claim omitted jobId")?;
     let attempt_id = job["attemptId"]
@@ -516,22 +525,64 @@ pub fn run_once_from_config(coven_home: &Path) -> Result<()> {
 }
 
 pub fn start_if_configured(coven_home: &Path) -> Result<()> {
-    let Some(config) = load_config(coven_home)? else {
+    if load_config(coven_home)?.is_none() || executor_control::has_managed_owner(coven_home) {
         return Ok(());
-    };
+    }
     let home = coven_home.to_path_buf();
     std::thread::Builder::new()
         .name("coven-fleet-executor".into())
-        .spawn(move || loop {
-            let outcome = HttpFleetTransport::new(&config.hub_url)
-                .and_then(|transport| run_once(&transport, &home, &config, None));
-            if let Err(error) = outcome {
+        .spawn(move || {
+            if let Err(error) = serve_foreground(&home, ExecutorOwner::Legacy) {
                 eprintln!("coven daemon: fleet executor: {error:#}");
-                std::thread::sleep(Duration::from_secs(2));
             }
         })
         .context("failed to start fleet executor worker")?;
     Ok(())
+}
+
+/// Run the fleet polling lifecycle in this process/thread. The worker lock is
+/// held for the whole call, so a desktop child, scheduled task, and legacy
+/// daemon can never claim concurrently for one Coven home.
+pub fn serve_foreground(coven_home: &Path, owner: ExecutorOwner) -> Result<()> {
+    let config =
+        load_config(coven_home)?.context("this machine is not enrolled as a fleet executor")?;
+    let guard = executor_control::acquire_worker(coven_home, owner)?;
+    loop {
+        let control = executor_control::read_control(coven_home)?;
+        if owner == ExecutorOwner::Legacy && control.owner != ExecutorOwner::Legacy {
+            guard.publish(RuntimeState::Stopping)?;
+            return Ok(());
+        }
+        match control.desired_state {
+            DesiredState::Stopped => {
+                guard.publish(RuntimeState::Stopping)?;
+                return Ok(());
+            }
+            DesiredState::Paused => {
+                guard.publish(RuntimeState::Paused)?;
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+            DesiredState::Running => {}
+        }
+        guard.publish(RuntimeState::Claiming)?;
+        let outcome = HttpFleetTransport::new(&config.hub_url).and_then(|transport| {
+            run_once_with_renewal_interval(
+                &transport,
+                coven_home,
+                &config,
+                None,
+                Duration::from_secs(10),
+                2,
+                || guard.publish(RuntimeState::Executing),
+            )
+        });
+        guard.publish(RuntimeState::Idle)?;
+        if let Err(error) = outcome {
+            eprintln!("coven executor: fleet worker: {error:#}");
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -546,6 +597,31 @@ mod tests {
 
     struct InProcessTransport {
         hub_home: PathBuf,
+    }
+
+    #[test]
+    fn foreground_worker_honors_durable_stop_before_network_claim() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        save_config(
+            home.path(),
+            &ExecutorFleetConfig {
+                protocol_version: fleet::FLEET_PROTOCOL_VERSION.into(),
+                hub_url: "http://unreachable.invalid".into(),
+                node_id: "stopped-node".into(),
+                node_secret: "must-not-be-persisted-in-runtime".into(),
+                workspace_root: None,
+            },
+        )?;
+        executor_control::set_desired(
+            home.path(),
+            DesiredState::Stopped,
+            Some(ExecutorOwner::Headless),
+        )?;
+        serve_foreground(home.path(), ExecutorOwner::Headless)?;
+        let combined = std::fs::read_to_string(home.path().join("executor-control.json"))?;
+        assert!(!combined.contains("must-not-be-persisted-in-runtime"));
+        assert!(!home.path().join("executor-runtime.json").exists());
+        Ok(())
     }
 
     fn assert_tree_omits(root: &Path, needles: &[&str]) -> Result<()> {
@@ -803,6 +879,8 @@ mod tests {
             &config,
             None,
             Duration::from_millis(1),
+            25,
+            || Ok(()),
         )?;
         assert!(
             sentinel.exists(),

@@ -241,10 +241,13 @@ pub fn install(
         scheduler.create_or_replace(&registration.task_name, &desired)?;
     }
     let running = daemon_running(coven_home)?;
-    if !running {
-        scheduler.run(&registration.task_name)?;
-    }
     status(scheduler, coven_home, |_| Ok(running))
+}
+
+#[cfg(any(windows, test))]
+pub fn start(scheduler: &dyn TaskScheduler, coven_home: &Path) -> Result<()> {
+    let registration = load_registration(&registration_path(coven_home))?;
+    scheduler.run(&registration.task_name)
 }
 
 pub fn status(
@@ -300,8 +303,8 @@ pub fn uninstall(
     }
 }
 
-/// Hidden scheduled-task entrypoint. The callback should call
-/// `daemon::serve_forever(home, timestamp, None, &[])` and must not detach.
+/// Hidden scheduled-task entrypoint. The callback runs the fleet executor in
+/// the foreground so Task Scheduler can supervise the actual worker.
 pub fn run_foreground(
     registration_file: &Path,
     serve: impl FnOnce(&Path) -> Result<()>,
@@ -522,13 +525,15 @@ mod tests {
     }
 
     #[test]
-    fn install_is_idempotent_and_skips_run_for_live_daemon() -> Result<()> {
+    fn install_is_idempotent_and_never_activates() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let home = dir.path().join("home");
         let exe = dir.path().join("coven.exe");
         let scheduler = FakeScheduler::default();
         install(&scheduler, &home, &exe, |_| Ok(false))?;
         install(&scheduler, &home, &exe, |_| Ok(true))?;
+        assert_eq!(&*scheduler.calls.borrow(), &["create"]);
+        start(&scheduler, &home)?;
         assert_eq!(&*scheduler.calls.borrow(), &["create", "run"]);
         let json = fs::read_to_string(registration_path(&home))?;
         assert!(!json.contains("secret"));
@@ -545,6 +550,21 @@ mod tests {
         uninstall(&scheduler, &home, |_| Ok(()))?;
         uninstall(&scheduler, &home, |_| Ok(()))?;
         assert!(!registration_path(&home).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn uninstall_refuses_to_end_or_delete_when_drain_fails() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = dir.path().join("home");
+        let scheduler = FakeScheduler::default();
+        install(&scheduler, &home, &dir.path().join("coven.exe"), |_| {
+            Ok(false)
+        })?;
+        let error = uninstall(&scheduler, &home, |_| bail!("worker still active")).unwrap_err();
+        assert!(error.to_string().contains("worker still active"));
+        assert_eq!(&*scheduler.calls.borrow(), &["create"]);
+        assert!(registration_path(&home).exists());
         Ok(())
     }
 

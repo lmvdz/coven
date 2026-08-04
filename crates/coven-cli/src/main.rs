@@ -28,6 +28,7 @@ mod engine_install;
 mod eval_loop;
 #[cfg(any(windows, test))]
 mod executor_autostart;
+mod executor_control;
 mod executor_node;
 mod familiar_identity;
 mod fleet;
@@ -867,6 +868,11 @@ enum ExecutorCommand {
         #[command(subcommand)]
         command: ExecutorAutostartCommand,
     },
+    #[command(about = "Control the local foreground fleet executor")]
+    Local {
+        #[command(subcommand)]
+        command: ExecutorLocalCommand,
+    },
     #[command(hide = true)]
     FleetRunOnce,
     #[command(about = "Offload one bounded command to an eligible fleet executor")]
@@ -900,7 +906,7 @@ enum ExecutorAutostartCommand {
     Install {
         #[arg(
             long,
-            help = "Stop the current daemon and immediately transfer supervision to Task Scheduler"
+            help = "Immediately transfer executor supervision to Task Scheduler"
         )]
         activate: bool,
     },
@@ -916,6 +922,23 @@ enum ExecutorAutostartCommand {
         #[arg(long)]
         registration: PathBuf,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum ExecutorLocalCommand {
+    #[command(about = "Show redacted local executor lifecycle status")]
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Finish current work, then stop claiming new work")]
+    Pause,
+    #[command(about = "Allow the local executor to claim work")]
+    Resume,
+    #[command(about = "Finish current work, then stop the executor process")]
+    Stop,
+    #[command(hide = true)]
+    Serve,
 }
 
 #[derive(Subcommand, Debug)]
@@ -3249,6 +3272,7 @@ fn run_executor_command(command: ExecutorCommand) -> Result<()> {
             Ok(())
         }
         ExecutorCommand::Autostart { command } => run_executor_autostart_command(command),
+        ExecutorCommand::Local { command } => run_executor_local_command(command),
         ExecutorCommand::FleetRunOnce => {
             let home = coven_home_dir()?;
             fleet_executor::run_once_from_config(&home)
@@ -3314,6 +3338,52 @@ fn run_executor_command(command: ExecutorCommand) -> Result<()> {
     }
 }
 
+fn run_executor_local_command(command: ExecutorLocalCommand) -> Result<()> {
+    let home = coven_home_dir()?;
+    let config = fleet_executor::load_config(&home)?;
+    let status = || {
+        let configured = config.is_some();
+        let node_id = config.as_ref().map(|value| value.node_id.clone());
+        let workspace_root = config.as_ref().map(|value| {
+            value
+                .workspace_root
+                .clone()
+                .unwrap_or_else(|| home.join("executor-workspace"))
+        });
+        executor_control::status(&home, configured, node_id, workspace_root)
+    };
+    match command {
+        ExecutorLocalCommand::Status { json } => {
+            let state = status()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&state)?);
+            } else {
+                println!(
+                    "Fleet executor: {:?} (desired {:?}, owner {:?})",
+                    state.runtime_state, state.desired_state, state.owner
+                );
+            }
+        }
+        ExecutorLocalCommand::Pause => {
+            executor_control::set_desired(&home, executor_control::DesiredState::Paused, None)?;
+            println!("{}", serde_json::to_string_pretty(&status()?)?);
+        }
+        ExecutorLocalCommand::Resume => {
+            executor_control::set_desired(&home, executor_control::DesiredState::Running, None)?;
+            println!("{}", serde_json::to_string_pretty(&status()?)?);
+        }
+        ExecutorLocalCommand::Stop => {
+            executor_control::set_desired(&home, executor_control::DesiredState::Stopped, None)?;
+            println!("{}", serde_json::to_string_pretty(&status()?)?);
+        }
+        ExecutorLocalCommand::Serve => {
+            config.context("this machine is not enrolled as a fleet executor")?;
+            fleet_executor::serve_foreground(&home, executor_control::ExecutorOwner::Desktop)?;
+        }
+    }
+    Ok(())
+}
+
 fn run_executor_autostart_command(command: ExecutorAutostartCommand) -> Result<()> {
     #[cfg(not(windows))]
     {
@@ -3324,11 +3394,9 @@ fn run_executor_autostart_command(command: ExecutorAutostartCommand) -> Result<(
     {
         let home = coven_home_dir()?;
         let scheduler = executor_autostart::WindowsTaskScheduler;
-        let daemon_running = |home: &Path| -> Result<bool> {
-            Ok(matches!(
-                daemon::background_server_status(home)?,
-                Some(daemon::DaemonStatusState::Running(_))
-            ))
+        let executor_running = |home: &Path| -> Result<bool> {
+            let config = fleet_executor::load_config(home)?;
+            Ok(executor_control::status(home, config.is_some(), None, None)?.running)
         };
         match command {
             ExecutorAutostartCommand::Install { activate } => {
@@ -3342,17 +3410,28 @@ fn run_executor_autostart_command(command: ExecutorAutostartCommand) -> Result<(
                     .context("failed to resolve the Coven executable")?
                     .canonicalize()
                     .context("failed to resolve the Coven executable for autostart")?;
+                executor_autostart::install(&scheduler, &home, &executable, executor_running)?;
                 if activate {
-                    daemon::stop_background_server(&home)?;
-                }
-                executor_autostart::install(&scheduler, &home, &executable, daemon_running)?;
-                for _ in 0..50 {
-                    if daemon_running(&home)? {
-                        break;
+                    let transfer =
+                        executor_control::drain_and_lock(&home, Duration::from_secs(30))?;
+                    transfer.transfer(
+                        executor_control::ExecutorOwner::Headless,
+                        executor_control::DesiredState::Running,
+                    )?;
+                    // The durable headless owner fences desktop and legacy
+                    // claimants. Release the worker slot before `/Run` so the
+                    // scheduled process cannot race itself and fail its
+                    // immediate try-lock acquisition.
+                    drop(transfer);
+                    executor_autostart::start(&scheduler, &home)?;
+                    for _ in 0..50 {
+                        if executor_running(&home)? {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
                     }
-                    std::thread::sleep(Duration::from_millis(100));
                 }
-                let status = executor_autostart::status(&scheduler, &home, daemon_running)?;
+                let status = executor_autostart::status(&scheduler, &home, executor_running)?;
                 println!("{}", serde_json::to_string_pretty(&status)?);
                 if !status.daemon_running {
                     eprintln!(
@@ -3362,7 +3441,7 @@ fn run_executor_autostart_command(command: ExecutorAutostartCommand) -> Result<(
                 Ok(())
             }
             ExecutorAutostartCommand::Status { json } => {
-                let status = executor_autostart::status(&scheduler, &home, daemon_running)?;
+                let status = executor_autostart::status(&scheduler, &home, executor_running)?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&status)?);
                 } else {
@@ -3396,15 +3475,29 @@ fn run_executor_autostart_command(command: ExecutorAutostartCommand) -> Result<(
                 Ok(())
             }
             ExecutorAutostartCommand::Uninstall => {
+                let mut drained = None;
                 executor_autostart::uninstall(&scheduler, &home, |home| {
-                    daemon::stop_background_server(home).map(|_| ())
+                    drained = Some(executor_control::drain_and_lock(
+                        home,
+                        Duration::from_secs(30),
+                    )?);
+                    Ok(())
                 })?;
+                if let Some(guard) = drained {
+                    guard.transfer(
+                        executor_control::ExecutorOwner::Desktop,
+                        executor_control::DesiredState::Stopped,
+                    )?;
+                }
                 println!("Fleet executor autostart: uninstalled");
                 Ok(())
             }
             ExecutorAutostartCommand::Run { registration } => {
                 executor_autostart::run_foreground(&registration, |home| {
-                    daemon::serve_forever(home, current_timestamp(), None, &[])
+                    fleet_executor::serve_foreground(
+                        home,
+                        executor_control::ExecutorOwner::Headless,
+                    )
                 })
             }
         }
