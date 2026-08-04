@@ -33,6 +33,25 @@ pub struct ExecutorFleetConfig {
     pub hub_url: String,
     pub node_id: String,
     pub node_secret: String,
+    #[serde(default)]
+    pub workspace_root: Option<PathBuf>,
+}
+
+const DEFAULT_EXECUTOR_WORKSPACE_DIR: &str = "executor-workspace";
+
+fn executor_workspace_root(coven_home: &Path, configured_root: Option<&Path>) -> Result<PathBuf> {
+    let root = configured_root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| coven_home.join(DEFAULT_EXECUTOR_WORKSPACE_DIR));
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("failed to create executor workspace {}", root.display()))?;
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("failed to resolve executor workspace {}", root.display()))?;
+    if !root.is_dir() {
+        bail!("executor workspace is not a directory: {}", root.display());
+    }
+    Ok(root)
 }
 
 struct HttpResponse {
@@ -239,10 +258,18 @@ fn local_capabilities(
     })
 }
 
-pub fn enroll(coven_home: &Path, hub: &str, node_id: &str, code: &str) -> Result<()> {
+pub fn enroll(
+    coven_home: &Path,
+    hub: &str,
+    node_id: &str,
+    code: &str,
+    workspace_root: Option<&Path>,
+) -> Result<()> {
     if code.is_empty() {
         bail!("enrollment code is empty");
     }
+    // Validate local execution state before redeeming the single-use code.
+    let workspace_root = executor_workspace_root(coven_home, workspace_root)?;
     let transport = HttpFleetTransport::new(hub)?;
     let response = transport.post(
         "/api/v1/fleet/enrollments/redeem",
@@ -271,6 +298,7 @@ pub fn enroll(coven_home: &Path, hub: &str, node_id: &str, code: &str) -> Result
             hub_url: hub.trim_end_matches('/').to_string(),
             node_id: node_id.to_string(),
             node_secret: secret.to_string(),
+            workspace_root: Some(workspace_root),
         },
     )
 }
@@ -355,6 +383,7 @@ fn run_once_with_renewal_interval(
     }
     let workspace_binary: Option<OsString> = workspace_binary.map(OsStr::to_os_string);
     let coven_home_for_run = coven_home.to_path_buf();
+    let configured_workspace_root = config.workspace_root.clone();
 
     let (sender, receiver) = mpsc::sync_channel(1);
     let job_id_for_run = job_id.to_string();
@@ -367,6 +396,18 @@ fn run_once_with_renewal_interval(
                     let mut job: executor_node::ExecutorJob = serde_json::from_value(payload)
                         .context("claimed payload is not coven.executor.v1")?;
                     job.job_id = job_id_for_run;
+                    if job.cwd.is_none() {
+                        let executor_workspace = executor_workspace_root(
+                            &coven_home_for_run,
+                            configured_workspace_root.as_deref(),
+                        )?;
+                        job.cwd = Some(
+                            executor_workspace
+                                .to_str()
+                                .context("executor workspace path is not valid UTF-8")?
+                                .to_owned(),
+                        );
+                    }
                     Ok(serde_json::to_value(executor_node::run_job(&job))?)
                 }
                 Some(workspace_mobility::PROTOCOL_VERSION) => match workspace_binary.as_deref() {
@@ -568,11 +609,16 @@ mod tests {
     #[test]
     fn worker_claims_executes_and_completes_the_shared_envelope() -> Result<()> {
         let temp = tempfile::tempdir()?;
+        let cwd_command = if cfg!(windows) {
+            json!(["cmd.exe", "/C", "cd"])
+        } else {
+            json!(["pwd"])
+        };
         let payload = json!({
             "protocolVersion": "coven.executor.v1",
             "jobId": "placeholder",
             "requiredCapabilities": ["shell"],
-            "command": ["printf", "remote output"],
+            "command": cwd_command,
         });
         let transport = ScriptedTransport {
             responses: Mutex::new(vec![
@@ -589,6 +635,7 @@ mod tests {
             hub_url: "http://127.0.0.1:1".into(),
             node_id: "node-a".into(),
             node_secret: "test-node-secret".into(),
+            workspace_root: None,
         };
         run_once(&transport, temp.path(), &config, None)?;
         let requests = transport.requests.lock().unwrap();
@@ -597,8 +644,81 @@ mod tests {
         assert!(requests[1].0.contains("/jobs/claim?wait=25"));
         assert!(requests[2].0.ends_with("/complete"));
         assert_eq!(requests[2].2["result"]["status"], "completed");
-        assert_eq!(requests[2].2["result"]["stdout"], "remote output");
+        let expected_workspace = temp
+            .path()
+            .join(DEFAULT_EXECUTOR_WORKSPACE_DIR)
+            .canonicalize()?;
+        let reported_workspace = requests[2].2["result"]["stdout"]
+            .as_str()
+            .context("result omitted stdout")?
+            .trim();
+        assert_eq!(
+            Path::new(reported_workspace).canonicalize()?,
+            expected_workspace
+        );
         assert_eq!(requests[2].2["completionKey"], "complete:attempt-1");
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_job_cwd_overrides_executor_workspace() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let configured_workspace = temp.path().join("configured");
+        let explicit_workspace = temp.path().join("explicit");
+        std::fs::create_dir_all(&explicit_workspace)?;
+        let cwd_command = if cfg!(windows) {
+            json!(["cmd.exe", "/C", "cd"])
+        } else {
+            json!(["pwd"])
+        };
+        let payload = json!({
+            "protocolVersion": "coven.executor.v1",
+            "jobId": "placeholder",
+            "requiredCapabilities": ["shell"],
+            "command": cwd_command,
+            "cwd": explicit_workspace,
+        });
+        let transport = ScriptedTransport {
+            responses: Mutex::new(vec![
+                HttpResponse {
+                    status: 200,
+                    body: "{}".into(),
+                },
+                HttpResponse {
+                    status: 200,
+                    body: json!({"job": {
+                        "jobId": "job-explicit", "attemptId": "attempt-explicit",
+                        "leaseToken": "lease-explicit", "payload": payload
+                    }})
+                    .to_string(),
+                },
+                HttpResponse {
+                    status: 200,
+                    body: "{}".into(),
+                },
+            ]),
+            requests: Mutex::new(Vec::new()),
+        };
+        let config = ExecutorFleetConfig {
+            protocol_version: fleet::FLEET_PROTOCOL_VERSION.into(),
+            hub_url: "http://127.0.0.1:1".into(),
+            node_id: "node-a".into(),
+            node_secret: "test-node-secret".into(),
+            workspace_root: Some(configured_workspace),
+        };
+
+        run_once(&transport, temp.path(), &config, None)?;
+
+        let requests = transport.requests.lock().unwrap();
+        let reported_workspace = requests[2].2["result"]["stdout"]
+            .as_str()
+            .context("result omitted stdout")?
+            .trim();
+        assert_eq!(
+            Path::new(reported_workspace).canonicalize()?,
+            explicit_workspace.canonicalize()?
+        );
+        assert!(!config.workspace_root.as_ref().unwrap().exists());
         Ok(())
     }
 
@@ -631,6 +751,7 @@ mod tests {
             hub_url: "http://127.0.0.1:1".into(),
             node_id: "node-a".into(),
             node_secret: "test-node-secret".into(),
+            workspace_root: None,
         };
         run_once(&transport, temp.path(), &config, None)?;
         let requests = transport.requests.lock().unwrap();
@@ -674,6 +795,7 @@ mod tests {
             hub_url: "http://127.0.0.1:1".into(),
             node_id: "node-a".into(),
             node_secret: "test-node-secret".into(),
+            workspace_root: None,
         };
         run_once_with_renewal_interval(
             &transport,
@@ -702,6 +824,7 @@ mod tests {
             hub_url: "http://127.0.0.1:3000".into(),
             node_id: "node-a".into(),
             node_secret: "test-node-secret".into(),
+            workspace_root: None,
         };
         save_config(temp.path(), &config)?;
         assert_eq!(
@@ -719,6 +842,41 @@ mod tests {
                 0o600
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_executor_config_without_workspace_root_still_loads() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        std::fs::write(
+            config_path(temp.path()),
+            r#"{"protocolVersion":"coven.fleet.v1","hubUrl":"http://hub.invalid","nodeId":"legacy-node","nodeSecret":"legacy-secret"}"#,
+        )?;
+
+        let config = load_config(temp.path())?.context("legacy config did not load")?;
+
+        assert_eq!(config.node_id, "legacy-node");
+        assert_eq!(config.workspace_root, None);
+        assert_eq!(
+            executor_workspace_root(temp.path(), config.workspace_root.as_deref())?,
+            temp.path()
+                .join(DEFAULT_EXECUTOR_WORKSPACE_DIR)
+                .canonicalize()?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn executor_workspace_rejects_a_file() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let file = temp.path().join("not-a-workspace");
+        std::fs::write(&file, "not a directory")?;
+
+        let error = executor_workspace_root(temp.path(), Some(&file)).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("failed to create executor workspace"));
         Ok(())
     }
 
@@ -746,6 +904,7 @@ mod tests {
             hub_url: "http://hub.invalid".into(),
             node_id: "executor-b".into(),
             node_secret: redeemed["nodeSecret"].as_str().unwrap().into(),
+            workspace_root: None,
         };
         save_config(executor.path(), &config)?;
 
@@ -817,11 +976,14 @@ mod tests {
             ),
         )?;
         let redeemed: Value = serde_json::from_str(&redeemed.body)?;
+        let invalid_workspace = executor.path().join("not-a-workspace");
+        std::fs::write(&invalid_workspace, "actor protocol must ignore this")?;
         let config = ExecutorFleetConfig {
             protocol_version: fleet::FLEET_PROTOCOL_VERSION.into(),
             hub_url: "http://hub.invalid".into(),
             node_id: "workspace-b".into(),
             node_secret: redeemed["nodeSecret"].as_str().unwrap().into(),
+            workspace_root: Some(invalid_workspace),
         };
         let request = json!({
             "protocolVersion": workspace_mobility::PROTOCOL_VERSION,
@@ -869,11 +1031,14 @@ mod tests {
             ),
         )?;
         let redeemed: Value = serde_json::from_str(&redeemed.body)?;
+        let invalid_workspace = executor.path().join("not-a-workspace");
+        std::fs::write(&invalid_workspace, "actor protocol must ignore this")?;
         let config = ExecutorFleetConfig {
             protocol_version: fleet::FLEET_PROTOCOL_VERSION.into(),
             hub_url: "http://hub.invalid".into(),
             node_id: "actor-node".into(),
             node_secret: redeemed["nodeSecret"].as_str().unwrap().into(),
+            workspace_root: Some(invalid_workspace),
         };
         let transport = InProcessTransport {
             hub_home: hub.path().to_path_buf(),
@@ -960,6 +1125,7 @@ json.dump(out,sys.stdout)
                 hub_url: "http://hub.invalid".into(),
                 node_id: node_id.into(),
                 node_secret: redeemed["nodeSecret"].as_str().unwrap().into(),
+                workspace_root: None,
             })
         };
         let config_a = enroll("node-a", executor_a.path())?;
@@ -1508,6 +1674,7 @@ json.dump(out,sys.stdout)
             hub_url: "http://hub.invalid".into(),
             node_id: "delegate-node".into(),
             node_secret: redeemed["nodeSecret"].as_str().unwrap().into(),
+            workspace_root: None,
         };
         let transport = InProcessTransport {
             hub_home: hub.path().into(),
@@ -1676,6 +1843,7 @@ json.dump(out,sys.stdout)
             hub_url: "http://hub.invalid".into(),
             node_id: "restart-executor".into(),
             node_secret: redeemed["nodeSecret"].as_str().unwrap().into(),
+            workspace_root: None,
         };
         save_config(first_executor.path(), &config)?;
         save_config(restarted_executor.path(), &config)?;

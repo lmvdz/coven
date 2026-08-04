@@ -79,16 +79,24 @@ In PowerShell 7, keep it out of command arguments and shell history:
 
 ```powershell
 $Coven = Join-Path $env:LOCALAPPDATA "CovenFleet\coven.exe"
+$env:COVEN_HOME = Join-Path $env:LOCALAPPDATA "CovenFleetTest"
+$TestWorkspace = Join-Path $env:USERPROFILE "CovenFleetTestWorkspace"
+New-Item -ItemType Directory -Force $env:COVEN_HOME | Out-Null
+New-Item -ItemType Directory -Force $TestWorkspace | Out-Null
 $Hub = "https://YOUR-MAC-NAME.YOUR-TAILNET.ts.net"
 $code = Read-Host "One-time enrollment code" -MaskInput
-$code | & $Coven executor enroll --hub $Hub --node-id windows-pc --code-stdin
+$code | & $Coven executor enroll --hub $Hub --node-id windows-pc `
+  --workspace-root $TestWorkspace --code-stdin
 $code = $null
 & $Coven daemon restart
 & $Coven executor fleet-status
 ```
 
 The Windows daemon now heartbeats and long-polls automatically. There is no
-receive command.
+receive command. Shell jobs without an explicit `--cwd` run in the enrolled
+workspace root; an explicit job working directory remains authoritative. Older
+fleet configurations without `workspaceRoot` safely default to
+`COVEN_HOME/executor-workspace` after upgrading.
 
 ## Prove remote execution
 

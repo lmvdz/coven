@@ -846,10 +846,15 @@ enum ExecutorCommand {
     },
     #[command(about = "Enroll this machine as an automatic fleet executor")]
     Enroll {
-        #[arg(long, help = "Hub base URL, currently http://host:port")]
+        #[arg(long, help = "Hub base URL using http or https")]
         hub: String,
         #[arg(long)]
         node_id: String,
+        #[arg(
+            long,
+            help = "Default directory for shell jobs; defaults to COVEN_HOME/executor-workspace"
+        )]
+        workspace_root: Option<PathBuf>,
         #[arg(long, help = "Read the single-use enrollment code from stdin")]
         code_stdin: bool,
     },
@@ -3176,6 +3181,7 @@ fn run_executor_command(command: ExecutorCommand) -> Result<()> {
         ExecutorCommand::Enroll {
             hub,
             node_id,
+            workspace_root,
             code_stdin,
         } => {
             if !code_stdin {
@@ -3184,7 +3190,13 @@ fn run_executor_command(command: ExecutorCommand) -> Result<()> {
             let code = io::read_to_string(io::stdin())
                 .context("failed to read enrollment code from stdin")?;
             let home = coven_home_dir()?;
-            fleet_executor::enroll(&home, &hub, &node_id, code.trim())?;
+            fleet_executor::enroll(
+                &home,
+                &hub,
+                &node_id,
+                code.trim(),
+                workspace_root.as_deref(),
+            )?;
             println!("enrolled {node_id}; restart or start `coven daemon` to receive fleet work");
             Ok(())
         }
@@ -3198,6 +3210,7 @@ fn run_executor_command(command: ExecutorCommand) -> Result<()> {
                         "hub": config.hub_url,
                         "nodeId": config.node_id,
                         "credentialStored": true,
+                        "workspaceRoot": config.workspace_root.unwrap_or_else(|| home.join("executor-workspace")),
                     })
                 ),
                 None => println!("{}", serde_json::json!({"configured": false})),

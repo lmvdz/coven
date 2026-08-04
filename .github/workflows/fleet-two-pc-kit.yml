@@ -38,6 +38,10 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }} -p coven-cli
+      - name: Test executor workspace isolation
+        run: |
+          cargo test --locked --target ${{ matrix.target }} -p coven-cli fleet_executor::tests::worker_claims_executes_and_completes_the_shared_envelope
+          cargo test --locked --target ${{ matrix.target }} -p coven-cli fleet_executor::tests::explicit_job_cwd_overrides_executor_workspace
       - name: Smoke fleet commands (macOS)
         if: runner.os == 'macOS'
         shell: bash
