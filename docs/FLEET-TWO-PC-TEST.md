@@ -59,11 +59,13 @@ attached for the duration of the proof:
 In a second Mac terminal, expose only that loopback listener to the tailnet:
 
 ```sh
-tailscale serve --bg http://127.0.0.1:8787
+COVEN_TAILSCALE_HTTPS_PORT=8443
+tailscale serve --bg --https="$COVEN_TAILSCALE_HTTPS_PORT" http://127.0.0.1:8787
 tailscale serve status
-curl "https://$HUB_FQDN/api/v1/health"
+curl "https://$HUB_FQDN:$COVEN_TAILSCALE_HTTPS_PORT/api/v1/health"
 ```
 
+The dedicated port preserves any existing Tailscale Serve route on port 443.
 Do not use Tailscale Funnel; this test needs tailnet-private Serve only.
 
 ## Enroll the Windows executor
@@ -83,20 +85,25 @@ $env:COVEN_HOME = Join-Path $env:LOCALAPPDATA "CovenFleetTest"
 $TestWorkspace = Join-Path $env:USERPROFILE "CovenFleetTestWorkspace"
 New-Item -ItemType Directory -Force $env:COVEN_HOME | Out-Null
 New-Item -ItemType Directory -Force $TestWorkspace | Out-Null
-$Hub = "https://YOUR-MAC-NAME.YOUR-TAILNET.ts.net"
+$Hub = "https://YOUR-MAC-NAME.YOUR-TAILNET.ts.net:8443"
 $code = Read-Host "One-time enrollment code" -MaskInput
 $code | & $Coven executor enroll --hub $Hub --node-id windows-pc `
   --workspace-root $TestWorkspace --code-stdin
 $code = $null
 & $Coven daemon restart
 & $Coven executor fleet-status
+& $Coven executor autostart install --activate
+& $Coven executor autostart status
 ```
 
 The Windows daemon now heartbeats and long-polls automatically. There is no
 receive command. Shell jobs without an explicit `--cwd` run in the enrolled
 workspace root; an explicit job working directory remains authoritative. Older
 fleet configurations without `workspaceRoot` safely default to
-`COVEN_HOME/executor-workspace` after upgrading.
+`COVEN_HOME/executor-workspace` after upgrading. Autostart runs the daemon as a
+least-privilege per-user scheduled task at login and supervises it in the
+foreground. Its registration stores paths only; the fleet node credential stays
+in the executor's private configuration.
 
 ## Prove remote execution
 
@@ -133,12 +140,12 @@ must resolve authentication from executor-local state.
 On Windows:
 
 ```powershell
-& $Coven daemon stop
+& $Coven executor autostart uninstall
 ```
 
 On the Mac, stop the foreground Coven daemon with `Ctrl-C`, then remove the
-tailnet proxy configuration:
+dedicated tailnet proxy without resetting unrelated Serve routes:
 
 ```sh
-tailscale serve reset
+tailscale serve --https=8443 off
 ```

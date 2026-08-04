@@ -26,6 +26,8 @@ mod encrypted_artifacts;
 mod engine;
 mod engine_install;
 mod eval_loop;
+#[cfg(any(windows, test))]
+mod executor_autostart;
 mod executor_node;
 mod familiar_identity;
 mod fleet;
@@ -860,6 +862,11 @@ enum ExecutorCommand {
     },
     #[command(about = "Show this machine's fleet executor configuration")]
     FleetStatus,
+    #[command(about = "Manage persistent fleet executor startup")]
+    Autostart {
+        #[command(subcommand)]
+        command: ExecutorAutostartCommand,
+    },
     #[command(hide = true)]
     FleetRunOnce,
     #[command(about = "Offload one bounded command to an eligible fleet executor")]
@@ -884,6 +891,30 @@ enum ExecutorCommand {
         timeout_seconds: u64,
         #[arg(long, help = "Read the harness-host request JSON from stdin")]
         request_stdin: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ExecutorAutostartCommand {
+    #[command(about = "Install or repair per-user executor autostart")]
+    Install {
+        #[arg(
+            long,
+            help = "Stop the current daemon and immediately transfer supervision to Task Scheduler"
+        )]
+        activate: bool,
+    },
+    #[command(about = "Show executor autostart and daemon health")]
+    Status {
+        #[arg(long, help = "Print status as JSON (machine-readable)")]
+        json: bool,
+    },
+    #[command(about = "Remove executor autostart and stop its daemon")]
+    Uninstall,
+    #[command(hide = true)]
+    Run {
+        #[arg(long)]
+        registration: PathBuf,
     },
 }
 
@@ -3217,6 +3248,7 @@ fn run_executor_command(command: ExecutorCommand) -> Result<()> {
             }
             Ok(())
         }
+        ExecutorCommand::Autostart { command } => run_executor_autostart_command(command),
         ExecutorCommand::FleetRunOnce => {
             let home = coven_home_dir()?;
             fleet_executor::run_once_from_config(&home)
@@ -3278,6 +3310,103 @@ fn run_executor_command(command: ExecutorCommand) -> Result<()> {
             )?;
             println!("{}", serde_json::to_string(&result)?);
             Ok(())
+        }
+    }
+}
+
+fn run_executor_autostart_command(command: ExecutorAutostartCommand) -> Result<()> {
+    #[cfg(not(windows))]
+    {
+        let _ = command;
+        bail!("fleet executor autostart is currently supported on Windows only");
+    }
+    #[cfg(windows)]
+    {
+        let home = coven_home_dir()?;
+        let scheduler = executor_autostart::WindowsTaskScheduler;
+        let daemon_running = |home: &Path| -> Result<bool> {
+            Ok(matches!(
+                daemon::background_server_status(home)?,
+                Some(daemon::DaemonStatusState::Running(_))
+            ))
+        };
+        match command {
+            ExecutorAutostartCommand::Install { activate } => {
+                fleet_executor::load_config(&home)?
+                    .context("this machine is not enrolled; run `coven executor enroll` first")?;
+                std::fs::create_dir_all(&home)?;
+                let home = home
+                    .canonicalize()
+                    .context("failed to resolve COVEN_HOME for executor autostart")?;
+                let executable = std::env::current_exe()
+                    .context("failed to resolve the Coven executable")?
+                    .canonicalize()
+                    .context("failed to resolve the Coven executable for autostart")?;
+                if activate {
+                    daemon::stop_background_server(&home)?;
+                }
+                executor_autostart::install(&scheduler, &home, &executable, daemon_running)?;
+                for _ in 0..50 {
+                    if daemon_running(&home)? {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                let status = executor_autostart::status(&scheduler, &home, daemon_running)?;
+                println!("{}", serde_json::to_string_pretty(&status)?);
+                if !status.daemon_running {
+                    eprintln!(
+                        "autostart is installed; the executor will start at the next user logon"
+                    );
+                }
+                Ok(())
+            }
+            ExecutorAutostartCommand::Status { json } => {
+                let status = executor_autostart::status(&scheduler, &home, daemon_running)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&status)?);
+                } else {
+                    println!(
+                        "Fleet executor autostart: {}",
+                        if status.installed {
+                            "installed"
+                        } else {
+                            "not installed"
+                        }
+                    );
+                    println!(
+                        "  definition: {}",
+                        if status.definition_matches {
+                            "current"
+                        } else {
+                            "missing or drifted"
+                        }
+                    );
+                    println!(
+                        "  daemon:     {}",
+                        if status.daemon_running {
+                            "running"
+                        } else {
+                            "not running"
+                        }
+                    );
+                    println!("  task:       {}", status.task_name);
+                    println!("  Coven home: {}", status.coven_home.display());
+                }
+                Ok(())
+            }
+            ExecutorAutostartCommand::Uninstall => {
+                executor_autostart::uninstall(&scheduler, &home, |home| {
+                    daemon::stop_background_server(home).map(|_| ())
+                })?;
+                println!("Fleet executor autostart: uninstalled");
+                Ok(())
+            }
+            ExecutorAutostartCommand::Run { registration } => {
+                executor_autostart::run_foreground(&registration, |home| {
+                    daemon::serve_forever(home, current_timestamp(), None, &[])
+                })
+            }
         }
     }
 }
