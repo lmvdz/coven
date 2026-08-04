@@ -180,7 +180,7 @@ pub fn task_xml(registration: &Registration, registration_file: &Path, user_id: 
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId></LogonTrigger></Triggers>
   <Principals><Principal id="Author"><UserId>{user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
-  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><AllowStartOnDemand>true</AllowStartOnDemand><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT10S</Interval><Count>999</Count></RestartOnFailure></Settings>
+  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><AllowStartOnDemand>true</AllowStartOnDemand><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure></Settings>
   <Actions Context="Author"><Exec><Command>{command}</Command><Arguments>{arguments}</Arguments></Exec></Actions>
 </Task>"#,
         user = xml_escape(user_id),
@@ -512,6 +512,8 @@ mod tests {
         let xml = task_xml(&registration, &registration_file, r"PC\Operator");
         assert!(xml.contains("InteractiveToken"));
         assert!(xml.contains("LeastPrivilege"));
+        assert!(xml.contains("<RestartOnFailure><Interval>PT1M</Interval><Count>999</Count>"));
+        assert!(!xml.contains("PT10S"));
         assert!(xml.contains("executor autostart run"));
         assert!(xml.contains("Example &amp; Co"));
         assert!(!xml.contains("nodeSecret"));
