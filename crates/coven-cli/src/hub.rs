@@ -821,6 +821,7 @@ pub fn enqueue_job(coven_home: &Path, body: Option<&str>) -> Result<ApiResponse>
         required_capabilities_json: serde_json::to_string(&request.required_capabilities)
             .context("failed to serialize required capabilities")?,
         assigned_node_id: None,
+        target_node_id: None,
         loop_id: request.loop_id,
         payload_json: request.payload.unwrap_or(Value::Null).to_string(),
         created_at: now.clone(),

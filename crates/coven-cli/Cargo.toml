@@ -39,6 +39,7 @@ rand = "0.9"
 regex = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = "1"
+webpki-roots = "1"
 rcgen = { version = "0.14", features = ["crypto", "pem", "ring"] }
 p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
 qrcode = { version = "0.14", default-features = false }

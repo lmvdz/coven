@@ -1,0 +1,78 @@
+name: Fleet two-PC install kit
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/fleet-two-pc-install
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fleet-two-pc-kit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Intel macOS
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: coven
+            artifact: coven-fleet-intel-macos
+          - label: Windows x64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary: coven.exe
+            artifact: coven-fleet-windows-x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} -p coven-cli
+      - name: Smoke fleet commands (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          target/${{ matrix.target }}/release/${{ matrix.binary }} --version
+          target/${{ matrix.target }}/release/${{ matrix.binary }} executor probe
+      - name: Smoke fleet commands (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "target/${{ matrix.target }}/release/${{ matrix.binary }}" --version
+          & "target/${{ matrix.target }}/release/${{ matrix.binary }}" executor probe
+      - name: Package Intel macOS kit
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p dist/${{ matrix.artifact }}
+          cp target/${{ matrix.target }}/release/${{ matrix.binary }} dist/${{ matrix.artifact }}/
+          cp docs/FLEET-TWO-PC-TEST.md dist/${{ matrix.artifact }}/README.md
+          (cd dist/${{ matrix.artifact }} && shasum -a 256 coven > SHA256SUMS)
+          tar -C dist -czf dist/${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
+      - name: Package Windows x64 kit
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $kit = "dist/${{ matrix.artifact }}"
+          New-Item -ItemType Directory -Force $kit | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" $kit
+          Copy-Item "docs/FLEET-TWO-PC-TEST.md" "$kit/README.md"
+          $hash = (Get-FileHash "$kit/coven.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash *coven.exe" | Set-Content "$kit/SHA256SUMS" -Encoding ascii
+          Compress-Archive -Path "$kit/*" -DestinationPath "dist/${{ matrix.artifact }}.zip"
+      - uses: actions/upload-artifact@v7.0.0
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}.*
+          if-no-files-found: error
+          retention-days: 14

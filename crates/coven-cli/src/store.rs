@@ -184,6 +184,7 @@ pub struct HubJobRecord {
     pub priority: i64,
     pub required_capabilities_json: String,
     pub assigned_node_id: Option<String>,
+    pub target_node_id: Option<String>,
     pub loop_id: Option<String>,
     pub payload_json: String,
     pub created_at: String,
@@ -472,6 +473,132 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_events_session_created_at
             ON events(session_id, created_at);
 
+        CREATE TABLE IF NOT EXISTS session_roams (
+            session_id TEXT PRIMARY KEY NOT NULL,
+            generation INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            record_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS session_lifecycles (
+            session_id TEXT PRIMARY KEY NOT NULL,
+            logical_state TEXT NOT NULL,
+            active_generation INTEGER NOT NULL,
+            active_placement_id TEXT,
+            pending_generation INTEGER,
+            pending_placement_id TEXT,
+            fenced_placement_id TEXT,
+            finalizing_placement_id TEXT,
+            next_input_seq INTEGER NOT NULL DEFAULT 1,
+            committed_revision_json TEXT,
+            retention_policy TEXT NOT NULL DEFAULT 'retain_until_ack',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS session_placements (
+            placement_id TEXT PRIMARY KEY NOT NULL,
+            session_id TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            node_id TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            state TEXT NOT NULL,
+            workspace_ref_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            activated_at TEXT,
+            released_at TEXT,
+            UNIQUE(session_id, generation),
+            FOREIGN KEY (session_id) REFERENCES session_lifecycles(session_id) ON DELETE CASCADE
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_session_one_active_placement
+            ON session_placements(session_id) WHERE state = 'active';
+
+        CREATE TABLE IF NOT EXISTS session_runs (
+            run_id TEXT PRIMARY KEY NOT NULL,
+            session_id TEXT NOT NULL,
+            placement_id TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            node_id TEXT,
+            state TEXT NOT NULL,
+            started_at TEXT,
+            exited_at TEXT,
+            exit_code INTEGER,
+            result_ref_json TEXT,
+            completion_key TEXT,
+            FOREIGN KEY (session_id) REFERENCES session_lifecycles(session_id) ON DELETE CASCADE,
+            FOREIGN KEY (placement_id) REFERENCES session_placements(placement_id)
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_session_one_live_run
+            ON session_runs(session_id) WHERE state IN ('queued','running');
+
+        CREATE TABLE IF NOT EXISTS session_queued_inputs (
+            input_id TEXT PRIMARY KEY NOT NULL,
+            session_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            payload_json TEXT NOT NULL,
+            state TEXT NOT NULL,
+            generation INTEGER,
+            UNIQUE(session_id, sequence),
+            FOREIGN KEY (session_id) REFERENCES session_lifecycles(session_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS session_finalizations (
+            finalization_id TEXT PRIMARY KEY NOT NULL,
+            run_id TEXT NOT NULL UNIQUE,
+            session_id TEXT NOT NULL,
+            placement_id TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            node_id TEXT NOT NULL,
+            result_digest TEXT NOT NULL,
+            result_json TEXT NOT NULL,
+            revision_json TEXT NOT NULL,
+            artifacts_json TEXT NOT NULL,
+            verification_json TEXT NOT NULL,
+            state TEXT NOT NULL,
+            idempotency_key TEXT UNIQUE,
+            committed_at TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (run_id) REFERENCES session_runs(run_id),
+            FOREIGN KEY (session_id) REFERENCES session_lifecycles(session_id) ON DELETE CASCADE,
+            FOREIGN KEY (placement_id) REFERENCES session_placements(placement_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS session_roam_sagas (
+            saga_id TEXT PRIMARY KEY NOT NULL,
+            session_id TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            request_digest TEXT NOT NULL,
+            state TEXT NOT NULL,
+            source_placement_id TEXT NOT NULL,
+            source_node_id TEXT NOT NULL,
+            source_generation INTEGER NOT NULL,
+            target_placement_id TEXT NOT NULL,
+            target_node_id TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            workspace_driver TEXT NOT NULL,
+            checkpoint_locator_json TEXT NOT NULL,
+            target_harness TEXT NOT NULL,
+            checkpoint_json TEXT,
+            checkpoint_job_id TEXT NOT NULL,
+            prepare_job_id TEXT NOT NULL,
+            input_job_id TEXT,
+            input_id TEXT,
+            error_json TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(session_id, generation),
+            FOREIGN KEY (session_id) REFERENCES session_lifecycles(session_id) ON DELETE CASCADE
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_session_one_live_roam_saga
+            ON session_roam_sagas(session_id)
+            WHERE state IN ('checkpoint_queued','prepare_queued','activating');
+
         CREATE TABLE IF NOT EXISTS sensitive_artifacts (
             id TEXT PRIMARY KEY NOT NULL,
             session_id TEXT NOT NULL,
@@ -600,6 +727,7 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
             priority INTEGER NOT NULL DEFAULT 0,
             required_capabilities_json TEXT NOT NULL,
             assigned_node_id TEXT,
+            target_node_id TEXT,
             loop_id TEXT,
             payload_json TEXT NOT NULL,
             created_at TEXT NOT NULL,
@@ -676,7 +804,49 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
     ensure_visibility_column(conn)?;
     ensure_familiar_id_column(conn)?;
     ensure_node_registry_dispatch_columns(conn)?;
+    ensure_column(
+        conn,
+        "hub_jobs",
+        "target_node_id",
+        "ALTER TABLE hub_jobs ADD COLUMN target_node_id TEXT",
+    )?;
     ensure_session_external_columns(conn)?;
+    ensure_column(
+        conn,
+        "session_lifecycles",
+        "pending_generation",
+        "ALTER TABLE session_lifecycles ADD COLUMN pending_generation INTEGER",
+    )?;
+    ensure_column(
+        conn,
+        "session_lifecycles",
+        "pending_placement_id",
+        "ALTER TABLE session_lifecycles ADD COLUMN pending_placement_id TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "session_lifecycles",
+        "fenced_placement_id",
+        "ALTER TABLE session_lifecycles ADD COLUMN fenced_placement_id TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "session_lifecycles",
+        "finalizing_placement_id",
+        "ALTER TABLE session_lifecycles ADD COLUMN finalizing_placement_id TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "session_runs",
+        "node_id",
+        "ALTER TABLE session_runs ADD COLUMN node_id TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "session_runs",
+        "completion_key",
+        "ALTER TABLE session_runs ADD COLUMN completion_key TEXT",
+    )?;
 
     backfill_events_fts_if_needed(conn)?;
 
@@ -1563,16 +1733,18 @@ pub fn upsert_hub_job(conn: &Connection, record: &HubJobRecord) -> Result<()> {
             priority,
             required_capabilities_json,
             assigned_node_id,
+            target_node_id,
             loop_id,
             payload_json,
             created_at,
             updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
         ON CONFLICT(job_id) DO UPDATE SET
             state = excluded.state,
             priority = excluded.priority,
             required_capabilities_json = excluded.required_capabilities_json,
             assigned_node_id = excluded.assigned_node_id,
+            target_node_id = excluded.target_node_id,
             loop_id = excluded.loop_id,
             payload_json = excluded.payload_json,
             updated_at = excluded.updated_at",
@@ -1582,6 +1754,7 @@ pub fn upsert_hub_job(conn: &Connection, record: &HubJobRecord) -> Result<()> {
             record.priority,
             &record.required_capabilities_json,
             &record.assigned_node_id,
+            &record.target_node_id,
             &record.loop_id,
             &record.payload_json,
             &record.created_at,
@@ -1599,15 +1772,16 @@ fn hub_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HubJobRecord> {
         priority: row.get(2)?,
         required_capabilities_json: row.get(3)?,
         assigned_node_id: row.get(4)?,
-        loop_id: row.get(5)?,
-        payload_json: row.get(6)?,
-        created_at: row.get(7)?,
-        updated_at: row.get(8)?,
+        target_node_id: row.get(5)?,
+        loop_id: row.get(6)?,
+        payload_json: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
     })
 }
 
 const HUB_JOB_COLUMNS: &str = "job_id, state, priority, required_capabilities_json, \
-     assigned_node_id, loop_id, payload_json, created_at, updated_at";
+     assigned_node_id, target_node_id, loop_id, payload_json, created_at, updated_at";
 
 pub fn get_hub_job(conn: &Connection, job_id: &str) -> Result<Option<HubJobRecord>> {
     conn.query_row(
@@ -1919,6 +2093,7 @@ pub fn update_session_status(
     exit_code: Option<i32>,
     updated_at: &str,
 ) -> Result<()> {
+    reject_managed_session_status_write(conn, session_id)?;
     conn.execute(
         "UPDATE sessions
          SET status = ?2,
@@ -1932,6 +2107,22 @@ pub fn update_session_status(
     Ok(())
 }
 
+pub fn get_roam(conn: &Connection, session_id: &str) -> Result<Option<crate::roam::RoamRecord>> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT record_json FROM session_roams WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .with_context(|| format!("failed to read roam record for session {session_id}"))?;
+    raw.map(|value| {
+        serde_json::from_str(&value)
+            .with_context(|| format!("failed to parse roam record for session {session_id}"))
+    })
+    .transpose()
+}
+
 pub fn update_session_status_if_current(
     conn: &Connection,
     session_id: &str,
@@ -1940,6 +2131,7 @@ pub fn update_session_status_if_current(
     exit_code: Option<i32>,
     updated_at: &str,
 ) -> Result<bool> {
+    reject_managed_session_status_write(conn, session_id)?;
     let affected = conn
         .execute(
             "UPDATE sessions
@@ -1952,6 +2144,18 @@ pub fn update_session_status_if_current(
         .with_context(|| format!("failed to update session {session_id}"))?;
 
     Ok(affected > 0)
+}
+
+fn reject_managed_session_status_write(conn: &Connection, session_id: &str) -> Result<()> {
+    let managed: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_lifecycles WHERE session_id=?1)",
+        params![session_id],
+        |row| row.get(0),
+    )?;
+    if managed {
+        anyhow::bail!("managed session status is a Session Authority projection")
+    }
+    Ok(())
 }
 
 /// Persist the harness-native id that continues a multi-turn conversation.
@@ -1985,7 +2189,8 @@ pub fn mark_running_sessions_orphaned(conn: &Connection, updated_at: &str) -> Re
              SET status = 'orphaned',
                  updated_at = ?1
              WHERE status = 'running'
-               AND external = 0",
+               AND external = 0
+               AND id NOT IN (SELECT session_id FROM session_lifecycles)",
             params![updated_at],
         )
         .context("failed to mark running sessions orphaned")?;
@@ -2009,7 +2214,8 @@ pub fn mark_stale_created_sessions_failed(
             "UPDATE sessions
              SET status = 'failed',
                  updated_at = ?2
-             WHERE status = 'created' AND created_at < ?1",
+             WHERE status = 'created' AND created_at < ?1
+               AND id NOT IN (SELECT session_id FROM session_lifecycles)",
             params![created_before, updated_at],
         )
         .context("failed to mark stale created sessions failed")?;

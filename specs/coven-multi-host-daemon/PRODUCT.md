@@ -1,8 +1,9 @@
 # Coven Multi-Host Daemon Architecture - PRODUCT
 
-**Status:** Draft v0.1 - 2026-07-04
+**Status:** v0.2 architecture baseline - fleet roaming ratified 2026-08-03
 **Owner:** Coven runtime - Coven Cave
 **Tracks:** GitHub issues #264, #265, #267, #268, #269, #270
+**Companion:** [Fleet roaming decision](./ROAM-DECISION.md)
 
 ## Problem
 
@@ -20,7 +21,8 @@ This spec defines the multi-host daemon architecture and the travel-mode contrac
 
 - Preserve Coven runtime as the authority boundary.
 - Introduce a Server hub role that owns canonical familiar memory, loop state, node registry, and global/per-executor job queues.
-- Introduce stateless executor nodes dispatched by the hub over SSH/private network links.
+- Introduce non-authoritative executor nodes that receive hub-leased work through
+  an authenticated outbound channel or a hub-managed SSH/private-network link.
 - Introduce a Laptop travel client with a local-only sub-daemon, read-only travel profile cache, local lightweight agents, offline queue, and reconnect delta.
 - Make conflict behavior simple: the hub wins canonical familiar-memory conflicts; offline laptop results append as evidence/events instead of replacing hub memory.
 - Split implementation responsibilities cleanly between `OpenCoven/coven` and `OpenCoven/coven-cave`.
@@ -30,7 +32,9 @@ This spec defines the multi-host daemon architecture and the travel-mode contrac
 - No hosted Coven account system.
 - No browser-exposed raw daemon socket.
 - No peer-to-peer executor mesh.
-- No executor-initiated callback channel to the hub.
+- No executor-initiated authority changes; executor-originated fleet traffic is
+  limited to authenticated enrollment redemption, liveness/capability
+  observations, lease claims, progress, and completion.
 - No multi-writer familiar memory.
 - No automatic remote trust based only on network reachability.
 - No replacement for the existing same-user local socket model on each node.
@@ -47,8 +51,8 @@ flowchart TB
   Hub --> JobQueues[(Global and per-executor queues)]
   Hub --> NodeRegistry[(Node registry)]
 
-  Hub -->|poll/dispatch over SSH or private network| Stationary[Stationary executor daemon]
-  Hub -->|poll/dispatch over SSH or private network| Compute[Compute executor daemon]
+  Hub <-->|authenticated leased job channel| Stationary[Stationary executor daemon]
+  Hub <-->|authenticated leased job channel| Compute[Compute executor daemon]
 
   LaptopCave[Cave on laptop] --> TravelSock[Laptop local socket]
   TravelSock --> TravelDaemon[Laptop travel sub-daemon]
@@ -80,16 +84,30 @@ The hub may run local work, but that is not its defining role. Its defining role
 
 ### Executor nodes
 
-Stationary and compute executor nodes are stateless work runners from the product perspective.
+Stationary and compute executor nodes are non-authoritative work runners from
+the product perspective. They may retain local managed-process state and
+workspace caches required for a live session, but that state is not canonical
+hub state.
 
 They may keep local process/session state needed to run assigned jobs, but they do not own canonical familiar memory, scheduler policy, global queues, or reconciliation.
 
 Executor constraints:
 
-- The hub polls and dispatches; executor nodes do not initiate contact.
-- Communication uses SSH or a private-network transport selected by the hub.
+- An enrolled daemon may maintain an authenticated outbound channel for
+  capabilities, liveness, lease claims, progress, and completion.
+- The hub remains the only scheduler and lease authority. SSH/private-network
+  push dispatch remains an optional operator-managed transport.
 - Executors advertise capability, availability, queue pressure, and health.
 - If an executor disappears, the hub preserves queue state and decides whether to pause, redispatch, or mark work blocked.
+- Session roaming is automatically received by the selected daemon; users do
+  not run a receive command on the target.
+
+### Dual-role laptops
+
+A laptop may participate as both an intermittent executor and a travel client.
+Executor eligibility requires a live hub lease. Travel mode remains scoped,
+read-only, and append-only during disconnection; it never inherits executor or
+hub authority merely because both roles share one daemon process.
 
 ### Laptop travel client
 
@@ -212,7 +230,10 @@ The current local daemon model remains valid for single-machine use, but these c
 
 - **Local socket only:** current docs reject remote access. Multi-host mode must not tunnel the raw local socket; it needs explicit hub-to-node transport and auth.
 - **Single authority assumption:** current store/session docs assume one daemon owns all state. The hub model must define which state is canonical and which state is local cache.
-- **Per-familiar SSH patterns:** any existing or planned per-familiar SSH runtime must not bypass the hub scheduler or create executor-initiated authority.
+- **Per-familiar SSH patterns:** any existing or planned per-familiar SSH runtime must not bypass the hub scheduler or create executor-initiated authority. SSH is one transport for the shared leased-job protocol, not the executor model itself.
+- **Stateless job assumption:** interactive harness sessions outlive bounded job
+  calls. Executors need daemon-managed session actors whose identity and
+  readiness are reported to the hub without making local state canonical.
 - **Event log locality:** event IDs and session ordering need hub-owned sequencing or a reconciliation-safe mapping for offline travel deltas.
 - **Memory writes:** current local memory behavior must become hub-authoritative in multi-host mode; travel clients can propose additions, not overwrite.
 - **Health semantics:** local `health` is insufficient; Cave needs hub reachability, travel profile freshness, node availability, queue pressure, and handoff state.
@@ -221,7 +242,7 @@ The current local daemon model remains valid for single-machine use, but these c
 
 - #264 tracks the epic.
 - #265 is satisfied by this product/technical spec pair.
-- #267 implements the stateless executor protocol and SSH dispatcher.
+- #267 implements the base executor protocol and SSH dispatcher.
 - #268 implements travel profile and reconcile APIs.
 - #269 implements scheduler intelligence and loop redispatch.
 - #270 implements failure simulations and release gates.

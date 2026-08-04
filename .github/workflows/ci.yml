@@ -66,6 +66,22 @@ jobs:
             coven-tui-metrics.txt
           if-no-files-found: error
 
+  fleet-release-proof:
+    name: Fleet release proof groups 1-8
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install native link dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+      - name: Verify release proof manifest
+        run: node --test scripts/fleet-release-proof.test.mjs
+      - name: Run fleet release proof groups
+        run: node scripts/fleet-release-proof.mjs
+
   secret-guard:
     name: Secret guard
     runs-on: ubuntu-latest

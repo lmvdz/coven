@@ -1,17 +1,22 @@
 # Coven Multi-Host Daemon Architecture - TECH
 
-**Status:** Draft v0.1 - 2026-07-04
+**Status:** v0.2 architecture baseline - fleet roaming ratified 2026-08-03
 **Owner:** Coven runtime - Coven Cave
 **Tracks:** GitHub issues #264, #265, #267, #268, #269, #270
+**Companion:** [Fleet roaming decision](./ROAM-DECISION.md)
 
 ## Design constraints
 
 - The hub is the only canonical writer for familiar memory, loop state, node registry, and global/per-executor queues.
-- Executor nodes are dispatched by the hub; they do not initiate authority-bearing contact.
+- Executor nodes never initiate authority changes. Enrolled daemons may initiate
+  authenticated fleet traffic to advertise fresh capabilities, claim hub-owned
+  leases, and report progress or completion.
 - Laptop travel clients run a local-only sub-daemon and reconcile through the hub.
 - Offline deltas append results and proposed memory changes; they never overwrite canonical memory directly.
 - The existing same-user Unix socket remains the local control plane per machine.
 - Remote links are explicit hub-managed transports, not raw socket exposure.
+- Outbound fleet channels and hub-initiated SSH deliver the same job envelope
+  and share one hub-owned queue, lease, and generation model.
 
 ## State model
 
@@ -29,6 +34,9 @@ The exact schema can evolve, but the hub needs these durable entities:
 | `travel_profiles` | Generated profile metadata, source revisions, expiry, and revocation state. |
 | `travel_deltas` | Uploaded offline delta envelopes and reconciliation status. |
 | `scheduler_decisions` | Explanation records for Cave and debugging. |
+| `node_credentials` | Revocable node credential verifiers and protocol ranges. |
+| `job_leases` | Attempt, owner, token verifier, expiry, renewal, and idempotency state. |
+| `session_roams` | Hub-owned generation, source/target, checkpoint, and cutover state. |
 
 ### Laptop travel state
 
@@ -224,20 +232,32 @@ Valid states:
 - `syncing_delta`
 - `hub_resumed`
 
-## Executor protocol and SSH dispatcher
+## Executor protocol and fleet transports
 
-The stateless executor protocol is versioned as `coven.executor.v1` and is
-shared by stationary and compute executor roles. The hub is the only side
-that initiates contact:
+The executor protocol is versioned as `coven.executor.v1` and is shared by
+stationary and compute executor roles. The hub is the only authority that
+creates and assigns work, while delivery supports two transports:
 
-- The hub polls availability by running `coven executor probe` on the node
+- **Outbound fleet channel:** an enrolled daemon authenticates, reports a
+  capability/liveness lease, long-polls for assigned work, and reports results.
+- **Hub-initiated transport:** the hub polls availability by running `coven executor probe` on the node
   over an outbound transport. Executors never push registration or
-  heartbeats to the hub.
+  heartbeats on this transport.
 - The hub dispatches work by running `coven executor run-job` and sending
   the job spec on stdin.
 - Transports are hub-owned: `ssh` (batch mode, `StrictHostKeyChecking=yes`,
   outbound only) or `local` (private-network/same-host process launch).
   The raw daemon socket is never exposed.
+
+Executor-originated requests cannot choose their assignment, generation, or
+authority. The hub validates node identity, lease attempt, expiry, and session
+generation on every mutation. Tailnet identity may be additional evidence but
+does not replace Coven enrollment credentials.
+
+Interactive harnesses are not represented as indefinitely running generic
+jobs. A bounded `start-session` job asks the daemon to create a managed session
+actor and return a readiness proof plus local run identifier. Subsequent input
+is routed by the hub to that active `(session, generation, node)` assignment.
 
 ### Probe envelope (`coven executor probe`)
 
@@ -319,7 +339,8 @@ always see one shape).
 Acceptance coverage for #267:
 
 - hub dispatches jobs outbound over SSH/private network;
-- hub polls executor availability; executors never push to the hub;
+- hub-initiated transports poll executor availability without node callbacks;
+  the fleet transport separately accepts authenticated liveness leases;
 - job specs carry full context so executor nodes need no local durable
   authority;
 - executors return stdout/stderr/result metadata in a normalized envelope;
@@ -538,6 +559,14 @@ The release gate for #270 should simulate these scenarios with deterministic fix
 6. Travel client attempts canonical memory overwrite; hub rejects overwrite and stores it only as a proposed addition/review item.
 7. Stale travel profile crosses `stale_after`; Cave-visible state becomes `travel_stale`.
 8. Expired travel profile crosses `expires_at`; laptop refuses travel-mode execution for that profile.
+9. Executor lease expires while a laptop sleeps; its node becomes unavailable
+   and cannot claim or complete new work with the expired lease.
+10. Target daemon restarts during restore; the idempotent attempt resumes or is
+    retried without producing two active generations.
+11. A stale source submits output after cutover; the hub rejects it by session,
+    generation, and node identity.
+12. Duplicate connections present one node credential; the hub accepts only the
+    current connection/lease epoch for work mutation.
 
 ## Cave contract
 
@@ -567,6 +596,8 @@ Hard requirements:
 - Do not expose `<covenHome>/coven.sock` over TCP.
 - Do not let a browser page talk directly to a daemon socket.
 - Authenticate hub-to-node dispatch.
+- Authenticate node-to-hub fleet requests with revocable node-scoped
+  credentials established through one-time enrollment.
 - Pin or verify node identity.
 - Treat executor results as untrusted until the hub validates job identity and expected outputs.
 - Keep provider credentials in provider/harness auth flows.
@@ -576,8 +607,11 @@ Hard requirements:
 ## Implementation order
 
 1. Land this spec (#265).
-2. Add the stateless executor protocol and hub-owned SSH dispatcher (#267).
+2. Add the base executor protocol and hub-owned SSH dispatcher (#267).
 3. Add hub-owned travel profile generation and offline delta reconciliation APIs (#268).
 4. Add scheduler decision model and debug output (#269).
 5. Add failure simulations and release gates (#270).
 6. Wire Cave UI to explicit travel/handoff/scheduler state.
+7. Add the fleet channel and automatic roaming saga defined in
+   `ROAM-DECISION.md`; prove it with two isolated daemons before adding UI or
+   provider-specific optimizations.

@@ -707,12 +707,20 @@ fn output_observer_with_cleanup(
             let text = String::from_utf8(chunk)
                 .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned());
             if let Some(output_home) = output_home.as_deref() {
-                let _ = record_session_event(
-                    output_home,
-                    &output_session_id,
-                    "output",
-                    json!({ "data": text }),
-                );
+                match crate::session_authority::is_managed(output_home, &output_session_id) {
+                    Ok(true) => {
+                        // Managed output must arrive with a placement/run tuple through
+                        // Session Authority; a session-id-only callback is untrusted.
+                    }
+                    _ => {
+                        let _ = record_session_event(
+                            output_home,
+                            &output_session_id,
+                            "output",
+                            json!({"data":text}),
+                        );
+                    }
+                }
             }
         }),
         on_exit: Box::new(move |result| {
@@ -735,6 +743,9 @@ fn record_session_exit(
     session_id: &str,
     result: pty_runner::PtyRunResult,
 ) -> Result<()> {
+    if crate::session_authority::is_managed(coven_home, session_id)? {
+        anyhow::bail!("managed session exit requires an authority-bound run observer")
+    }
     let conn = crate::store::open_store(&coven_home.join("coven.sqlite3"))?;
     if let Some(session) = crate::store::get_session(&conn, session_id)? {
         if session.status == "running" {
@@ -2252,6 +2263,10 @@ pub fn serve_forever(
         coven_home.to_path_buf(),
     ));
     start_threads_proposal_scheduler(coven_home)?;
+    crate::delegation::reconcile_all(coven_home)?;
+    crate::delegation_matrix::reconcile_all(coven_home)?;
+    crate::session_roam::reconcile_all(coven_home)?;
+    crate::fleet_executor::start_if_configured(coven_home)?;
 
     if let Some(addr) = tcp_addr {
         let tcp_listener = bind_tcp_listener(addr)?;
@@ -2429,13 +2444,17 @@ where
         None
     };
     let response = match local_control.unwrap_or_else(|| {
-        crate::api::handle_request_with_runtime(
+        crate::api::handle_request_with_runtime_and_auth(
             method,
             path,
             coven_home,
             status,
             body.as_deref(),
             runtime,
+            crate::api::RequestSecurity {
+                authorization: headers.authorization.as_deref(),
+                local_transport: matches!(guard, HostGuard::Disabled),
+            },
         )
     }) {
         Ok(response) => response,
@@ -2633,6 +2652,7 @@ fn http_reason_phrase(status: u16) -> &'static str {
         201 => "Created",
         202 => "Accepted",
         400 => "Bad Request",
+        401 => "Unauthorized",
         404 => "Not Found",
         409 => "Conflict",
         413 => "Payload Too Large",
@@ -2658,6 +2678,7 @@ struct ParsedHeaders {
     content_length: usize,
     host: Option<String>,
     origin: Option<String>,
+    authorization: Option<String>,
 }
 
 fn read_http_headers<R: BufRead>(reader: &mut R) -> Result<ParsedHeaders> {
@@ -2665,6 +2686,7 @@ fn read_http_headers<R: BufRead>(reader: &mut R) -> Result<ParsedHeaders> {
         content_length: 0,
         host: None,
         origin: None,
+        authorization: None,
     };
     let mut header = String::new();
     loop {
@@ -2684,6 +2706,8 @@ fn read_http_headers<R: BufRead>(reader: &mut R) -> Result<ParsedHeaders> {
                 headers.host = Some(value.to_string());
             } else if name.eq_ignore_ascii_case("origin") {
                 headers.origin = Some(value.to_string());
+            } else if name.eq_ignore_ascii_case("authorization") {
+                headers.authorization = Some(value.to_string());
             }
         }
     }
@@ -2776,6 +2800,10 @@ pub fn serve_forever(
         coven_home.to_path_buf(),
     ));
     start_threads_proposal_scheduler(coven_home)?;
+    crate::delegation::reconcile_all(coven_home)?;
+    crate::delegation_matrix::reconcile_all(coven_home)?;
+    crate::session_roam::reconcile_all(coven_home)?;
+    crate::fleet_executor::start_if_configured(coven_home)?;
 
     const MAX_INFLIGHT: usize = 64;
     let inflight = Arc::new(AtomicUsize::new(0));

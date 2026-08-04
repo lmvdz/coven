@@ -114,6 +114,7 @@ flowchart TB
 | `coven hooks install` | Install local protocol hooks that block unsafe commits and protected pushes; see [cli-claim](cli-claim.md). |
 | `coven engine status/install/which` | Manage the pinned Coven engine (`coven-code`); see [cli-engine](cli-engine.md). |
 | `coven executor probe/run-job` | Stateless executor-node protocol commands, hub-dispatched over SSH; see [cli-executor](cli-executor.md). |
+| `coven delegate start/status/integrate/cancel` | Run a durable remote child and explicitly accept or discard its provisional result; see [cli-delegate](cli-delegate.md). |
 | `coven pc` | macOS-first diagnostics and explicit `--confirm` relief operations. |
 | `coven completions <shell>` | Print shell completions for bash, zsh, fish, elvish, or powershell. |
 | `coven familiars/skills/memory/research/calls` | Read-path Cave parity views; see [cli-observe](cli-observe.md). |

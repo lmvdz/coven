@@ -177,6 +177,12 @@ pub struct ApiResponse {
     pub body: String,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RequestSecurity<'a> {
+    pub authorization: Option<&'a str>,
+    pub local_transport: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionLaunch {
     pub id: String,
@@ -288,6 +294,29 @@ pub fn handle_request_with_runtime(
     daemon: Option<DaemonStatus>,
     body: Option<&str>,
     runtime: &dyn SessionRuntime,
+) -> Result<ApiResponse> {
+    handle_request_with_runtime_and_auth(
+        method,
+        path,
+        coven_home,
+        daemon,
+        body,
+        runtime,
+        RequestSecurity {
+            authorization: None,
+            local_transport: true,
+        },
+    )
+}
+
+pub fn handle_request_with_runtime_and_auth(
+    method: &str,
+    path: &str,
+    coven_home: &Path,
+    daemon: Option<DaemonStatus>,
+    body: Option<&str>,
+    runtime: &dyn SessionRuntime,
+    security: RequestSecurity<'_>,
 ) -> Result<ApiResponse> {
     let (route, query) = split_path_query(path);
     let route = match normalize_api_route(route) {
@@ -583,6 +612,95 @@ pub fn handle_request_with_runtime(
         }
         ("POST", "/scheduler/decisions") => scheduler_decision(coven_home, body),
         ("POST", "/scheduler/redispatch") => scheduler_redispatch(coven_home, body),
+        ("GET", "/fleet/ux") if security.local_transport => crate::fleet_ux::snapshot(
+            coven_home,
+            query.and_then(|value| query_param(value, "sessionId")),
+        ),
+        ("GET", "/fleet/ux") => api_error(
+            403,
+            "local_transport_required",
+            "Fleet UX is available only through the local daemon socket.",
+            None,
+        ),
+        ("POST", path)
+            if security.local_transport
+                && path.starts_with("/fleet/ux/delegations/")
+                && path.ends_with("/integrate") =>
+        {
+            fleet_ux_delegation_decision(coven_home, path, "/integrate", body, true)
+        }
+        ("POST", path)
+            if security.local_transport
+                && path.starts_with("/fleet/ux/delegations/")
+                && path.ends_with("/cancel") =>
+        {
+            fleet_ux_delegation_decision(coven_home, path, "/cancel", body, false)
+        }
+        ("POST", path)
+            if path.starts_with("/fleet/ux/delegations/")
+                && (path.ends_with("/integrate") || path.ends_with("/cancel")) =>
+        {
+            api_error(
+                403,
+                "local_transport_required",
+                "Fleet delegation decisions require the local daemon socket.",
+                None,
+            )
+        }
+        ("POST", "/fleet/enrollments") if security.local_transport => {
+            crate::fleet::issue_enrollment(coven_home, body)
+        }
+        ("POST", "/fleet/enrollments") => api_error(
+            403,
+            "local_transport_required",
+            "Enrollment codes can only be issued through the local daemon socket.",
+            None,
+        ),
+        ("POST", "/fleet/enrollments/redeem") => crate::fleet::redeem_enrollment(coven_home, body),
+        ("POST", path) if path.starts_with("/fleet/nodes/") && path.ends_with("/heartbeat") => {
+            let node_id = path
+                .trim_start_matches("/fleet/nodes/")
+                .trim_end_matches("/heartbeat");
+            crate::fleet::heartbeat(coven_home, node_id, security.authorization, body)
+        }
+        ("POST", path)
+            if security.local_transport
+                && path.starts_with("/fleet/nodes/")
+                && path.ends_with("/revoke") =>
+        {
+            let node_id = path
+                .trim_start_matches("/fleet/nodes/")
+                .trim_end_matches("/revoke");
+            crate::fleet::revoke_node(coven_home, node_id)
+        }
+        ("POST", path) if path.starts_with("/fleet/nodes/") && path.ends_with("/jobs/claim") => {
+            let node_id = path
+                .trim_start_matches("/fleet/nodes/")
+                .trim_end_matches("/jobs/claim");
+            let wait_seconds = query
+                .and_then(|value| query_param(value, "wait"))
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            crate::fleet::claim_job(coven_home, node_id, security.authorization, wait_seconds)
+        }
+        ("POST", path) if path.starts_with("/fleet/jobs/") && path.ends_with("/renew") => {
+            let job_id = path
+                .trim_start_matches("/fleet/jobs/")
+                .trim_end_matches("/renew");
+            crate::fleet::renew_lease(coven_home, job_id, security.authorization, body)
+        }
+        ("POST", path) if path.starts_with("/fleet/jobs/") && path.ends_with("/complete") => {
+            let job_id = path
+                .trim_start_matches("/fleet/jobs/")
+                .trim_end_matches("/complete");
+            crate::fleet::complete_job(coven_home, job_id, security.authorization, body)
+        }
+        ("POST", path) if path.starts_with("/fleet/jobs/") && path.ends_with("/fail") => {
+            let job_id = path
+                .trim_start_matches("/fleet/jobs/")
+                .trim_end_matches("/fail");
+            crate::fleet::fail_job(coven_home, job_id, security.authorization, body)
+        }
         ("GET", "/hub/status") => crate::hub::hub_status(coven_home),
         ("POST", "/hub/nodes") => crate::hub::register_node(coven_home, body),
         ("GET", "/hub/nodes") => crate::hub::list_nodes(coven_home),
@@ -657,6 +775,82 @@ pub fn handle_request_with_runtime(
             let session_id = session_action_id(path, "/kill");
             kill_session(coven_home, session_id, runtime)
         }
+        ("POST", path) if path.starts_with("/sessions/") && path.ends_with("/handoffs") => {
+            let session_id = session_action_id(path, "/handoffs");
+            crate::handoff::emit(coven_home, session_id, body)
+        }
+        ("GET", path) if path.starts_with("/sessions/") && path.ends_with("/handoffs") => {
+            let session_id = session_action_id(path, "/handoffs");
+            crate::handoff::list(
+                coven_home,
+                session_id,
+                query_param(query.unwrap_or_default(), "latest") == Some("true"),
+            )
+        }
+        ("POST", path)
+            if security.local_transport
+                && path.starts_with("/sessions/")
+                && path.ends_with("/roam/progress") =>
+        {
+            api_error(
+                409,
+                "session_authority_required",
+                "Roam advancement is owned by validated fleet completion.",
+                None,
+            )
+        }
+        ("POST", path) if path.starts_with("/sessions/") && path.ends_with("/roam/progress") => {
+            api_error(
+                403,
+                "local_transport_required",
+                "Roam progress compatibility updates require the local daemon socket.",
+                None,
+            )
+        }
+        ("POST", path)
+            if security.local_transport
+                && path.starts_with("/sessions/")
+                && path.ends_with("/roam/automatic") =>
+        {
+            let session_id = session_action_id(path, "/roam/automatic");
+            crate::roam::start_automatic(coven_home, session_id, body)
+        }
+        ("POST", path) if path.starts_with("/sessions/") && path.ends_with("/roam/automatic") => {
+            api_error(
+                403,
+                "local_transport_required",
+                "Automatic session roam commands require the local daemon socket.",
+                None,
+            )
+        }
+        ("POST", path)
+            if security.local_transport
+                && path.starts_with("/sessions/")
+                && path.ends_with("/roam") =>
+        {
+            let session_id = session_action_id(path, "/roam");
+            crate::roam::start(coven_home, session_id, body)
+        }
+        ("POST", path) if path.starts_with("/sessions/") && path.ends_with("/roam") => api_error(
+            403,
+            "local_transport_required",
+            "Session roam commands require the local daemon socket.",
+            None,
+        ),
+        ("GET", path)
+            if security.local_transport
+                && path.starts_with("/sessions/")
+                && path.ends_with("/roam") =>
+        {
+            let session_id = session_action_id(path, "/roam");
+            crate::roam::get(coven_home, session_id)
+        }
+        ("GET", path) if path.starts_with("/sessions/") && path.ends_with("/roam") => api_error(
+            403,
+            "local_transport_required",
+            "Session roam status requires the local daemon socket.",
+            None,
+        ),
         ("GET", path) if path.starts_with("/sessions/") && path.ends_with("/log") => {
             let session_id = session_action_id(path, "/log");
             list_session_log(coven_home, session_id)
@@ -2015,7 +2209,8 @@ fn record_input(
             Some(json!({ "sessionId": session_id })),
         );
     };
-    if session.status != "running" {
+    let managed = crate::session_authority::is_managed(coven_home, session_id)?;
+    if !managed && session.status != "running" {
         return session_not_live_response(session_id);
     }
 
@@ -2043,6 +2238,25 @@ fn record_input(
             "input payload requires string field `data`",
             Some(json!({ "sessionId": session_id })),
         );
+    }
+    if managed {
+        let disposition = crate::session_authority::queue_input(coven_home, session_id, &payload)?;
+        match disposition {
+            crate::session_authority::InputDisposition::Queued { sequence, .. } => {
+                if let Err(error) = crate::session_roam::reconcile_session(coven_home, session_id) {
+                    eprintln!(
+                        "coven daemon: managed input delivery reconciliation deferred for `{session_id}`: {error:#}"
+                    );
+                }
+                return json_response(
+                    202,
+                    &json!({ "ok":true,"accepted":true,"queued":true,"sequence":sequence }),
+                );
+            }
+            crate::session_authority::InputDisposition::Route { .. } => {
+                unreachable!("hub-managed input never assumes a local executor")
+            }
+        }
     }
     if let Err(error) = runtime.send_input(session_id, &payload) {
         // Match the typed sentinel from the daemon runtime instead of
@@ -2080,6 +2294,14 @@ fn kill_session(
             Some(json!({ "sessionId": session_id })),
         );
     };
+    if crate::session_authority::is_managed(coven_home, session_id)? {
+        return api_error(
+            409,
+            "managed_session_authority_required",
+            "Managed session cancellation must be reserved through Session Authority.",
+            Some(json!({"sessionId":session_id})),
+        );
+    }
     if session.status != "running" {
         return session_not_live_response(session_id);
     }
@@ -6077,6 +6299,131 @@ fn split_path_query(path: &str) -> (&str, Option<&str>) {
     }
 }
 
+fn fleet_ux_delegation_decision(
+    coven_home: &Path,
+    path: &str,
+    suffix: &str,
+    body: Option<&str>,
+    integrate: bool,
+) -> Result<ApiResponse> {
+    let Some(delegation_id) = path
+        .strip_prefix("/fleet/ux/delegations/")
+        .and_then(|value| value.strip_suffix(suffix))
+        .filter(|value| valid_fleet_ux_id(value))
+    else {
+        return api_error(
+            400,
+            "invalid_delegation_id",
+            "delegationId is invalid.",
+            None,
+        );
+    };
+    if let Some(raw) = body.filter(|raw| !raw.trim().is_empty()) {
+        let empty_object = serde_json::from_str::<Value>(raw)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .is_some_and(|object| object.is_empty());
+        if !empty_object {
+            return api_error(
+                400,
+                "invalid_request",
+                "Fleet delegation decisions do not accept request fields.",
+                None,
+            );
+        }
+    }
+    let current = match crate::delegation::status(coven_home, delegation_id) {
+        Ok(current) => current,
+        Err(_) => {
+            return api_error(
+                404,
+                "delegation_not_found",
+                "Delegation was not found.",
+                Some(json!({"delegationId":delegation_id})),
+            )
+        }
+    };
+    let outcome = if integrate {
+        if !matches!(
+            current.state.as_str(),
+            "ready_to_integrate" | "applying" | "cleanup_queued" | "finalized"
+        ) {
+            return api_error(
+                409,
+                "integration_conflict",
+                "Delegation is not ready to integrate.",
+                Some(
+                    json!({"delegationId":delegation_id,"state":fleet_ux_delegation_state(&current.state)}),
+                ),
+            );
+        }
+        crate::delegation::integrate(
+            coven_home,
+            delegation_id,
+            &fleet_ux_finalization_key(delegation_id),
+        )
+    } else {
+        if matches!(
+            current.state.as_str(),
+            "applying" | "recovery_conflict" | "cleanup_queued" | "finalized"
+        ) {
+            return api_error(
+                409,
+                "delegation_conflict",
+                "Delegation integration has already been acknowledged.",
+                Some(
+                    json!({"delegationId":delegation_id,"state":fleet_ux_delegation_state(&current.state)}),
+                ),
+            );
+        }
+        crate::delegation::cancel(coven_home, delegation_id)
+    };
+    if outcome.is_err() {
+        return api_error(
+            409,
+            if integrate {
+                "integration_conflict"
+            } else {
+                "delegation_conflict"
+            },
+            if integrate {
+                "Delegation integration could not be completed."
+            } else {
+                "Delegation cancellation could not be completed."
+            },
+            Some(json!({"delegationId":delegation_id})),
+        );
+    }
+    crate::fleet_ux::snapshot(coven_home, None)
+}
+
+fn fleet_ux_finalization_key(delegation_id: &str) -> String {
+    let digest = Sha256::digest(format!("fleet-ux-integrate\0{delegation_id}").as_bytes());
+    format!(
+        "uxint_{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+    )
+}
+
+fn valid_fleet_ux_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn fleet_ux_delegation_state(state: &str) -> &'static str {
+    match state {
+        "ready_to_integrate" => "ready",
+        "conflicted" => "conflicted",
+        "finalized" | "cleanup_queued" => "completed",
+        "failed" | "failure_cleanup_queued" => "failed",
+        "cancelled" | "cancel_cleanup_queued" | "cancel_requested" => "cancelled",
+        _ => "pending",
+    }
+}
+
 pub(crate) fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     query.split('&').find_map(|part| {
         let (candidate, value) = part.split_once('=')?;
@@ -7910,6 +8257,426 @@ mod tests {
         assert_eq!(
             runtime.inputs.borrow().as_slice(),
             &["session-1:hello coven"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn managed_input_queues_durably_during_cutover_without_touching_source_runtime(
+    ) -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session_with_status(temp_dir.path(), "session-1", "idle")?;
+        crate::session_authority::begin_transfer(
+            temp_dir.path(),
+            "session-1",
+            "node-b",
+            "actor-b",
+            &json!({}),
+        )?;
+        let runtime = RecordingRuntime::default();
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/session-1/input",
+            temp_dir.path(),
+            None,
+            Some(r#"{"data":"during cutover"}"#),
+            &runtime,
+        )?;
+        assert_eq!(response.status, 202);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["accepted"], true);
+        assert_eq!(body["queued"], true);
+        assert!(runtime.inputs.borrow().is_empty());
+        assert_eq!(
+            crate::session_authority::queued_inputs(temp_dir.path(), "session-1")?.len(),
+            1
+        );
+        let conn = crate::store::open_store(&temp_dir.path().join(crate::STORE_FILE_NAME))?;
+        assert!(crate::store::list_events(&conn, "session-1")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn managed_input_stays_durable_until_executor_delivery_ack() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session_with_status(temp_dir.path(), "session-1", "idle")?;
+        let placement = crate::session_authority::begin_transfer(
+            temp_dir.path(),
+            "session-1",
+            "node-local",
+            "actor-local",
+            &json!({}),
+        )?;
+        crate::session_authority::activate_placement(
+            temp_dir.path(),
+            "session-1",
+            &placement.placement_id,
+            placement.generation,
+            "node-local",
+        )?;
+        let runtime = RecordingRuntime::default();
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/session-1/input",
+            temp_dir.path(),
+            None,
+            Some(r#"{"data":"active"}"#),
+            &runtime,
+        )?;
+        assert_eq!(response.status, 202);
+        assert!(response.body.contains(r#""queued":true"#));
+        assert!(runtime.inputs.borrow().is_empty());
+        let conn = crate::store::open_store(&temp_dir.path().join(crate::STORE_FILE_NAME))?;
+        let events = crate::store::list_events(&conn, "session-1")?;
+        assert!(events.is_empty());
+        assert_eq!(
+            crate::session_authority::queued_inputs(temp_dir.path(), "session-1")?.len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn remote_transport_cannot_advance_roam_authority() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let runtime = RecordingRuntime::default();
+        let response = handle_request_with_runtime_and_auth(
+            "POST",
+            "/sessions/session-1/roam/progress",
+            temp_dir.path(),
+            None,
+            Some(r#"{"generation":1,"nodeId":"node-b","state":"active"}"#),
+            &runtime,
+            RequestSecurity {
+                authorization: None,
+                local_transport: false,
+            },
+        )?;
+        assert_eq!(response.status, 403);
+        assert!(response.body.contains("local_transport_required"));
+        let local = handle_request_with_runtime_and_auth(
+            "POST",
+            "/sessions/session-1/roam/progress",
+            temp_dir.path(),
+            None,
+            Some(r#"{"generation":1,"nodeId":"node-b","state":"active"}"#),
+            &runtime,
+            RequestSecurity {
+                authorization: None,
+                local_transport: true,
+            },
+        )?;
+        assert_eq!(local.status, 409);
+        assert!(local.body.contains("session_authority_required"));
+        Ok(())
+    }
+
+    #[test]
+    fn fleet_ux_snapshot_is_local_only_and_accepts_session_filter() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        store::open_store(&store_path(home.path()))?;
+        let runtime = RecordingRuntime::default();
+        let denied = handle_request_with_runtime_and_auth(
+            "GET",
+            "/api/v1/fleet/ux?sessionId=session-one",
+            home.path(),
+            None,
+            None,
+            &runtime,
+            RequestSecurity {
+                authorization: Some("Bearer executor-secret"),
+                local_transport: false,
+            },
+        )?;
+        assert_eq!(denied.status, 403);
+        assert!(!denied.body.contains("executor-secret"));
+        let allowed = handle_request(
+            "GET",
+            "/api/v1/fleet/ux?sessionId=session-one",
+            home.path(),
+            None,
+        )?;
+        assert_eq!(allowed.status, 200);
+        let value: Value = serde_json::from_str(&allowed.body)?;
+        assert_eq!(value["protocolVersion"], crate::fleet_ux::PROTOCOL_VERSION);
+        Ok(())
+    }
+
+    #[test]
+    fn fleet_ux_delegation_decisions_are_local_redacted_and_replay_safe() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let repo = tempfile::tempdir()?;
+        let git = |arguments: &[&str]| -> anyhow::Result<String> {
+            let output = std::process::Command::new("git")
+                .args(arguments)
+                .current_dir(repo.path())
+                .output()?;
+            anyhow::ensure!(output.status.success(), "git fixture command failed");
+            Ok(String::from_utf8(output.stdout)?.trim().into())
+        };
+        git(&["init", "-q"])?;
+        git(&["config", "user.email", "fleet-ux@example.invalid"])?;
+        git(&["config", "user.name", "Fleet UX Test"])?;
+        std::fs::write(repo.path().join("base.txt"), "base\n")?;
+        git(&["add", "base.txt"])?;
+        git(&["commit", "-qm", "base"])?;
+        let started = crate::delegation::start(
+            home.path(),
+            crate::delegation::DelegationRequest {
+                protocol_version: crate::delegation::PROTOCOL_VERSION.into(),
+                delegation_id: Some("ux-delegation".into()),
+                parent_session_id: None,
+                parent_repo: repo.path().into(),
+                base_revision: git(&["rev-parse", "HEAD"])?,
+                task: "work".into(),
+                workspace_driver: "filesystem".into(),
+                base_checkpoint: json!({}),
+                result_locator: json!({}),
+                requirements: vec![],
+                preferences: vec![],
+                harness: "fake".into(),
+            },
+        )?;
+        let runtime = RecordingRuntime::default();
+        let remote = RequestSecurity {
+            authorization: Some("Bearer executor-secret"),
+            local_transport: false,
+        };
+        let denied = handle_request_with_runtime_and_auth(
+            "POST",
+            "/fleet/ux/delegations/ux-delegation/cancel",
+            home.path(),
+            None,
+            None,
+            &runtime,
+            remote,
+        )?;
+        assert_eq!(denied.status, 403);
+        assert_eq!(
+            crate::delegation::status(home.path(), &started.delegation_id)?.state,
+            "queued"
+        );
+
+        let local = RequestSecurity {
+            authorization: None,
+            local_transport: true,
+        };
+        let injected = handle_request_with_runtime_and_auth(
+            "POST",
+            "/fleet/ux/delegations/ux-delegation/integrate",
+            home.path(),
+            None,
+            Some(r#"{"finalizationKey":"caller-controlled"}"#),
+            &runtime,
+            local,
+        )?;
+        assert_eq!(injected.status, 400);
+        assert_eq!(
+            serde_json::from_str::<Value>(&injected.body)?["error"]["code"],
+            "invalid_request"
+        );
+        assert_eq!(
+            crate::delegation::status(home.path(), &started.delegation_id)?.state,
+            "queued"
+        );
+
+        let not_ready = handle_request_with_runtime_and_auth(
+            "POST",
+            "/fleet/ux/delegations/ux-delegation/integrate",
+            home.path(),
+            None,
+            Some("{}"),
+            &runtime,
+            local,
+        )?;
+        assert_eq!(not_ready.status, 409);
+        assert_eq!(
+            serde_json::from_str::<Value>(&not_ready.body)?["error"]["code"],
+            "integration_conflict"
+        );
+
+        for _ in 0..2 {
+            let cancelled = handle_request_with_runtime_and_auth(
+                "POST",
+                "/fleet/ux/delegations/ux-delegation/cancel",
+                home.path(),
+                None,
+                None,
+                &runtime,
+                local,
+            )?;
+            assert_eq!(cancelled.status, 200);
+            let value: Value = serde_json::from_str(&cancelled.body)?;
+            assert_eq!(value["protocolVersion"], crate::fleet_ux::PROTOCOL_VERSION);
+            assert_eq!(value["delegations"][0]["delegationId"], "ux-delegation");
+            assert_eq!(value["delegations"][0]["state"], "cancelled");
+            for forbidden in [
+                "parentRepo",
+                "jobId",
+                "childId",
+                "finalizationKey",
+                "nodeSecret",
+            ] {
+                assert!(
+                    !cancelled.body.contains(forbidden),
+                    "response leaked {forbidden}"
+                );
+            }
+        }
+        assert_eq!(
+            crate::delegation::status(home.path(), &started.delegation_id)?.state,
+            "cancelled"
+        );
+        assert_eq!(
+            fleet_ux_finalization_key("ux-delegation"),
+            fleet_ux_finalization_key("ux-delegation")
+        );
+        assert!(valid_fleet_ux_id(&fleet_ux_finalization_key(
+            "ux-delegation"
+        )));
+
+        for (id, expected_status, expected_code) in [
+            ("missing", 404, "delegation_not_found"),
+            ("bad%2Fid", 400, "invalid_delegation_id"),
+        ] {
+            let response = handle_request_with_runtime_and_auth(
+                "POST",
+                &format!("/fleet/ux/delegations/{id}/cancel"),
+                home.path(),
+                None,
+                None,
+                &runtime,
+                local,
+            )?;
+            assert_eq!(response.status, expected_status);
+            assert_eq!(
+                serde_json::from_str::<Value>(&response.body)?["error"]["code"],
+                expected_code
+            );
+        }
+        let replayed = crate::delegation::start(
+            home.path(),
+            crate::delegation::DelegationRequest {
+                protocol_version: crate::delegation::PROTOCOL_VERSION.into(),
+                delegation_id: Some("ux-integrated".into()),
+                parent_session_id: None,
+                parent_repo: repo.path().into(),
+                base_revision: git(&["rev-parse", "HEAD"])?,
+                task: "work".into(),
+                workspace_driver: "filesystem".into(),
+                base_checkpoint: json!({}),
+                result_locator: json!({}),
+                requirements: vec![],
+                preferences: vec![],
+                harness: "fake".into(),
+            },
+        )?;
+        let conn = crate::store::open_store(&home.path().join(crate::STORE_FILE_NAME))?;
+        conn.execute(
+            "INSERT INTO fleet_delegation_results
+             (delegation_id,result_digest,attempt_id,node_id,bundle_json,state,finalized_at)
+             VALUES (?1,'ux-result','ux-attempt','ux-node','{}','integrated',?2)",
+            rusqlite::params![replayed.delegation_id, current_timestamp()],
+        )?;
+        conn.execute(
+            "UPDATE fleet_delegations SET state='finalized',finalization_key=?2 WHERE delegation_id=?1",
+            rusqlite::params![replayed.delegation_id, fleet_ux_finalization_key(&replayed.delegation_id)],
+        )?;
+        drop(conn);
+        for _ in 0..2 {
+            let response = handle_request_with_runtime_and_auth(
+                "POST",
+                "/fleet/ux/delegations/ux-integrated/integrate",
+                home.path(),
+                None,
+                None,
+                &runtime,
+                local,
+            )?;
+            assert_eq!(response.status, 200);
+            assert_eq!(
+                serde_json::from_str::<Value>(&response.body)?["protocolVersion"],
+                crate::fleet_ux::PROTOCOL_VERSION
+            );
+            assert!(!response.body.contains("finalizationKey"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn roam_command_and_status_are_local_only_and_remote_attempts_do_not_mutate(
+    ) -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session_with_status(temp_dir.path(), "session-1", "idle")?;
+        let runtime = RecordingRuntime::default();
+        let security = RequestSecurity {
+            authorization: Some("Bearer executor-node-secret"),
+            local_transport: false,
+        };
+        let start = handle_request_with_runtime_and_auth(
+            "POST",
+            "/sessions/session-1/roam",
+            temp_dir.path(),
+            None,
+            Some(
+                r#"{"sourceNodeId":"node-a","targetNodeId":"node-b","targetHarness":"fake","workspace":{"driver":"filesystem","locator":{}}}"#,
+            ),
+            &runtime,
+            security,
+        )?;
+        assert_eq!(start.status, 403);
+        assert_eq!(
+            serde_json::from_str::<Value>(&start.body)?["error"]["code"],
+            "local_transport_required"
+        );
+        let read = handle_request_with_runtime_and_auth(
+            "GET",
+            "/sessions/session-1/roam",
+            temp_dir.path(),
+            None,
+            None,
+            &runtime,
+            security,
+        )?;
+        assert_eq!(read.status, 403);
+        assert_eq!(
+            serde_json::from_str::<Value>(&read.body)?["error"]["code"],
+            "local_transport_required"
+        );
+        let automatic = handle_request_with_runtime_and_auth(
+            "POST",
+            "/sessions/session-1/roam/automatic",
+            temp_dir.path(),
+            None,
+            Some(r#"{"targetNodeId":"node-b"}"#),
+            &runtime,
+            security,
+        )?;
+        assert_eq!(automatic.status, 403);
+        assert_eq!(
+            serde_json::from_str::<Value>(&automatic.body)?["error"]["code"],
+            "local_transport_required"
+        );
+        let conn = crate::store::open_store(&temp_dir.path().join(crate::STORE_FILE_NAME))?;
+        assert!(crate::store::get_roam(&conn, "session-1")?.is_none());
+        drop(conn);
+
+        let local_read = handle_request_with_runtime_and_auth(
+            "GET",
+            "/sessions/session-1/roam",
+            temp_dir.path(),
+            None,
+            None,
+            &runtime,
+            RequestSecurity {
+                authorization: None,
+                local_transport: true,
+            },
+        )?;
+        assert_eq!(local_read.status, 404);
+        assert_eq!(
+            serde_json::from_str::<Value>(&local_read.body)?["error"]["code"],
+            "roam_not_found"
         );
         Ok(())
     }

@@ -756,6 +756,7 @@ dependencies = [
  "unicode-width",
  "url",
  "uuid",
+ "webpki-roots",
  "widestring",
  "windows-sys 0.61.2",
  "zeroize",

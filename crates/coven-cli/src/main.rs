@@ -18,13 +18,23 @@ mod cockpit_sources;
 mod control_plane;
 mod coven_calls;
 mod daemon;
+mod delegation;
+mod delegation_cleanup;
+mod delegation_executor;
+#[allow(dead_code)]
+mod delegation_matrix;
 mod encrypted_artifacts;
 mod engine;
 mod engine_install;
 mod eval_loop;
 mod executor_node;
 mod familiar_identity;
+mod fleet;
+mod fleet_executor;
+mod fleet_ux;
+mod handoff;
 mod harness;
+mod harness_host;
 mod hub;
 mod memory_dashboard;
 mod memory_import;
@@ -35,13 +45,19 @@ mod parallel_protocol;
 mod patch;
 mod paths;
 mod pc;
+pub mod placement_scheduler;
 mod privacy;
 mod project;
 mod prompt_refs;
 mod proposal_scheduler;
 mod pty_runner;
 mod repos_config;
+mod result_integration;
+mod roam;
+pub mod session_authority;
 mod session_launch;
+pub mod session_roam;
+pub mod session_roam_executor;
 mod settings;
 mod store;
 mod stream_json;
@@ -49,6 +65,7 @@ mod theme;
 mod tui;
 mod verification;
 mod ward_probes;
+mod workspace_mobility;
 // Wired into the daemon router via `POST /familiars/{id}/edits` (api.rs);
 // Gate 3 staging, deterministic probes, read surfaces, and explicit
 // coherence approval all compose through the Ward primitives in ward.rs.
@@ -223,6 +240,11 @@ enum Command {
     Executor {
         #[command(subcommand)]
         command: ExecutorCommand,
+    },
+    #[command(about = "Run and integrate remote child delegations")]
+    Delegate {
+        #[command(subcommand)]
+        command: DelegateCommand,
     },
     #[command(about = "Launch a project-scoped harness session")]
     #[command(after_help = "Examples:
@@ -500,6 +522,16 @@ enum Command {
         #[arg(long, help = "Print calls as JSON (machine-readable)")]
         json: bool,
     },
+    #[command(about = "Emit or inspect a portable session handoff")]
+    Handoff {
+        #[command(subcommand)]
+        command: HandoffCommand,
+    },
+    #[command(about = "Move a completed session turn to another executor")]
+    Roam {
+        #[command(subcommand)]
+        command: RoamCommand,
+    },
     #[command(about = "Inspect hub status, nodes, jobs, and routing (read-only)")]
     #[command(
         long_about = "Inspect hub status, nodes, jobs, and routing (read-only). These are read-only views over the multi-host hub control plane: hub role and queue depth, registered executor nodes, job and dispatch records, and the job-to-node routing table."
@@ -705,6 +737,46 @@ enum HubCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum HandoffCommand {
+    #[command(about = "Validate and store a coven.handoff.v1 packet read from stdin")]
+    Emit {
+        #[arg(long)]
+        session: String,
+    },
+    #[command(about = "Print the latest portable handoff packet")]
+    Inspect {
+        #[arg(long)]
+        session: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RoamCommand {
+    #[command(about = "Prepare a turn-boundary executor transfer")]
+    Start {
+        session: String,
+        #[arg(long, help = "Current executor node id")]
+        from: String,
+        #[arg(long, help = "Target node id; omit to select automatically")]
+        to: Option<String>,
+        #[arg(long, help = "Target harness/runtime id")]
+        harness: String,
+        #[arg(
+            long,
+            default_value = "s3-checkpoint",
+            help = "Workspace adapter (portable default: s3-checkpoint)"
+        )]
+        driver: String,
+        #[arg(long, help = "Driver-specific workspace locator as JSON")]
+        locator: String,
+        #[arg(long, help = "First instruction for the receiving harness")]
+        next: Option<String>,
+    },
+    #[command(about = "Inspect the current transfer generation and state")]
+    Status { session: String },
+}
+
+#[derive(Subcommand, Debug)]
 enum SchedulerCommand {
     #[command(about = "Show one scheduler decision (target, reason, inputs)")]
     Decision {
@@ -768,6 +840,83 @@ enum ExecutorCommand {
     Probe,
     #[command(about = "Run one hub-dispatched job from a JSON spec on stdin")]
     RunJob,
+    #[command(about = "Create a short-lived fleet enrollment code on this hub")]
+    EnrollmentCode {
+        #[arg(long)]
+        label: Option<String>,
+    },
+    #[command(about = "Enroll this machine as an automatic fleet executor")]
+    Enroll {
+        #[arg(long, help = "Hub base URL, currently http://host:port")]
+        hub: String,
+        #[arg(long)]
+        node_id: String,
+        #[arg(long, help = "Read the single-use enrollment code from stdin")]
+        code_stdin: bool,
+    },
+    #[command(about = "Show this machine's fleet executor configuration")]
+    FleetStatus,
+    #[command(hide = true)]
+    FleetRunOnce,
+    #[command(about = "Offload one bounded command to an eligible fleet executor")]
+    Offload {
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long, default_value_t = 300)]
+        timeout_seconds: u64,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    #[command(about = "Lease a coven.workspace-driver.v1 request to an eligible executor")]
+    Workspace {
+        #[arg(long, default_value_t = 300)]
+        timeout_seconds: u64,
+        #[arg(long, help = "Read the workspace-driver request JSON from stdin")]
+        request_stdin: bool,
+    },
+    #[command(about = "Lease a coven.harness-host.v1 actor operation")]
+    Actor {
+        #[arg(long, default_value_t = 300)]
+        timeout_seconds: u64,
+        #[arg(long, help = "Read the harness-host request JSON from stdin")]
+        request_stdin: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DelegateCommand {
+    #[command(about = "Queue a base-bound child delegation from JSON on stdin")]
+    Start {
+        #[arg(long)]
+        request_stdin: bool,
+    },
+    #[command(
+        about = "Read delegation state; use --collect to import results or acknowledge cleanup"
+    )]
+    Status {
+        delegation_id: String,
+        #[arg(long)]
+        collect: bool,
+    },
+    #[command(about = "Integrate an accepted child result with an idempotency key")]
+    Integrate {
+        delegation_id: String,
+        #[arg(long)]
+        finalization_key: String,
+    },
+    #[command(about = "Cancel a child delegation without accepting its result")]
+    Cancel { delegation_id: String },
+    #[command(about = "Queue a heterogeneous delegation matrix from JSON on stdin")]
+    MatrixStart {
+        #[arg(long)]
+        request_stdin: bool,
+    },
+    #[command(about = "Read or reconcile a heterogeneous delegation matrix")]
+    MatrixStatus {
+        matrix_id: String,
+        #[arg(long)]
+        collect: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1059,6 +1208,7 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Command::Daemon { command }) => run_daemon_command(command),
         Some(Command::Ward { command }) => run_ward_command(command),
         Some(Command::Executor { command }) => run_executor_command(command),
+        Some(Command::Delegate { command }) => run_delegate_command(command),
         Some(Command::Run {
             harness,
             prompt,
@@ -1167,6 +1317,8 @@ fn run_cli(cli: Cli) -> Result<()> {
         },
         Some(Command::Research { json }) => observe::run_research(json),
         Some(Command::Calls { id, json }) => observe::run_calls(id.as_deref(), json),
+        Some(Command::Handoff { command }) => run_handoff_command(command),
+        Some(Command::Roam { command }) => run_roam_command(command),
         Some(Command::Hub { command }) => match command {
             HubCommand::Status { json } => observe::run_hub_status(json),
             HubCommand::Nodes { id, json } => observe::run_hub_nodes(id.as_deref(), json),
@@ -1243,6 +1395,61 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Command::Models { args }) => run_engine_passthrough(Some("models"), &args),
         Some(Command::Acp { args }) => run_engine_passthrough(Some("acp"), &args),
         Some(Command::Code { args }) => run_engine_passthrough(None, &args),
+    }
+}
+
+fn print_control_response(response: api::ApiResponse) -> Result<()> {
+    println!("{}", response.body);
+    if (200..300).contains(&response.status) {
+        Ok(())
+    } else {
+        bail!("Coven control request failed with HTTP {}", response.status)
+    }
+}
+
+fn run_handoff_command(command: HandoffCommand) -> Result<()> {
+    let coven_home = coven_home_dir()?;
+    match command {
+        HandoffCommand::Emit { session } => {
+            let mut body = String::new();
+            io::stdin().read_to_string(&mut body)?;
+            if body.trim().is_empty() {
+                bail!("handoff packet JSON is required on stdin");
+            }
+            print_control_response(handoff::emit(&coven_home, &session, Some(&body))?)
+        }
+        HandoffCommand::Inspect { session } => {
+            print_control_response(handoff::list(&coven_home, &session, true)?)
+        }
+    }
+}
+
+fn run_roam_command(command: RoamCommand) -> Result<()> {
+    let coven_home = coven_home_dir()?;
+    match command {
+        RoamCommand::Start {
+            session,
+            from,
+            to,
+            harness,
+            driver,
+            locator,
+            next,
+        } => {
+            let locator: serde_json::Value =
+                serde_json::from_str(&locator).context("--locator must be valid JSON")?;
+            let body = serde_json::json!({
+                "sourceNodeId": from,
+                "targetNodeId": to,
+                "targetHarness": harness,
+                "workspace": { "driver": driver, "locator": locator },
+                "nextAction": next,
+            });
+            print_control_response(roam::start(&coven_home, &session, Some(&body.to_string()))?)
+        }
+        RoamCommand::Status { session } => {
+            print_control_response(roam::get(&coven_home, &session)?)
+        }
     }
 }
 
@@ -2957,7 +3164,166 @@ fn run_executor_command(command: ExecutorCommand) -> Result<()> {
             println!("{}", serde_json::to_string(&envelope)?);
             Ok(())
         }
+        ExecutorCommand::EnrollmentCode { label } => {
+            let home = coven_home_dir()?;
+            let body = serde_json::json!({"label": label}).to_string();
+            let response = fleet::issue_enrollment(&home, Some(&body))?;
+            if response.status != 201 {
+                anyhow::bail!("fleet enrollment creation failed: {}", response.body);
+            }
+            println!("{}", response.body);
+            Ok(())
+        }
+        ExecutorCommand::Enroll {
+            hub,
+            node_id,
+            code_stdin,
+        } => {
+            if !code_stdin {
+                anyhow::bail!("--code-stdin is required so enrollment codes do not appear in process arguments");
+            }
+            let code = io::read_to_string(io::stdin())
+                .context("failed to read enrollment code from stdin")?;
+            let home = coven_home_dir()?;
+            fleet_executor::enroll(&home, &hub, &node_id, code.trim())?;
+            println!("enrolled {node_id}; restart or start `coven daemon` to receive fleet work");
+            Ok(())
+        }
+        ExecutorCommand::FleetStatus => {
+            let home = coven_home_dir()?;
+            match fleet_executor::load_config(&home)? {
+                Some(config) => println!(
+                    "{}",
+                    serde_json::json!({
+                        "configured": true,
+                        "hub": config.hub_url,
+                        "nodeId": config.node_id,
+                        "credentialStored": true,
+                    })
+                ),
+                None => println!("{}", serde_json::json!({"configured": false})),
+            }
+            Ok(())
+        }
+        ExecutorCommand::FleetRunOnce => {
+            let home = coven_home_dir()?;
+            fleet_executor::run_once_from_config(&home)
+        }
+        ExecutorCommand::Offload {
+            cwd,
+            timeout_seconds,
+            command,
+        } => {
+            let home = coven_home_dir()?;
+            let result = fleet::offload_tool(
+                &home,
+                command,
+                cwd.as_deref(),
+                timeout_seconds,
+                Duration::from_secs(timeout_seconds.saturating_add(60)),
+            )?;
+            println!("{}", serde_json::to_string(&result)?);
+            if result.status == executor_node::RESULT_STATUS_COMPLETED {
+                Ok(())
+            } else {
+                bail!("remote command finished with status {}", result.status)
+            }
+        }
+        ExecutorCommand::Workspace {
+            timeout_seconds,
+            request_stdin,
+        } => {
+            if !request_stdin {
+                bail!("--request-stdin is required so scoped transfer URLs do not appear in process arguments");
+            }
+            let payload = io::read_to_string(io::stdin())
+                .context("failed to read workspace request from stdin")?;
+            let request =
+                serde_json::from_str(&payload).context("workspace request is not valid JSON")?;
+            let result = fleet::offload_workspace(
+                &coven_home_dir()?,
+                request,
+                Duration::from_secs(timeout_seconds.saturating_add(60)),
+            )?;
+            println!("{}", serde_json::to_string(&result)?);
+            Ok(())
+        }
+        ExecutorCommand::Actor {
+            timeout_seconds,
+            request_stdin,
+        } => {
+            if !request_stdin {
+                bail!("--request-stdin is required so actor input does not appear in process arguments");
+            }
+            let payload = io::read_to_string(io::stdin())
+                .context("failed to read actor request from stdin")?;
+            let request =
+                serde_json::from_str(&payload).context("actor request is not valid JSON")?;
+            let result = fleet::offload_harness(
+                &coven_home_dir()?,
+                request,
+                Duration::from_secs(timeout_seconds.saturating_add(60)),
+            )?;
+            println!("{}", serde_json::to_string(&result)?);
+            Ok(())
+        }
     }
+}
+
+fn run_delegate_command(command: DelegateCommand) -> Result<()> {
+    let home = coven_home_dir()?;
+    let status = match command {
+        DelegateCommand::Start { request_stdin } => {
+            if !request_stdin {
+                bail!("--request-stdin is required so workspace locators do not appear in process arguments");
+            }
+            let raw = io::read_to_string(io::stdin())
+                .context("failed to read delegation request from stdin")?;
+            let request =
+                serde_json::from_str(&raw).context("delegation request is not valid JSON")?;
+            serde_json::to_value(delegation::start(&home, request)?)?
+        }
+        DelegateCommand::Status {
+            delegation_id,
+            collect,
+        } => {
+            if collect {
+                serde_json::to_value(delegation::collect(&home, &delegation_id)?)?
+            } else {
+                serde_json::to_value(delegation::status(&home, &delegation_id)?)?
+            }
+        }
+        DelegateCommand::Integrate {
+            delegation_id,
+            finalization_key,
+        } => serde_json::to_value(delegation::integrate(
+            &home,
+            &delegation_id,
+            &finalization_key,
+        )?)?,
+        DelegateCommand::Cancel { delegation_id } => {
+            serde_json::to_value(delegation::cancel(&home, &delegation_id)?)?
+        }
+        DelegateCommand::MatrixStart { request_stdin } => {
+            if !request_stdin {
+                bail!("--request-stdin is required so workspace locators do not appear in process arguments");
+            }
+            let raw = io::read_to_string(io::stdin())
+                .context("failed to read delegation matrix request from stdin")?;
+            let request = serde_json::from_str(&raw)
+                .context("delegation matrix request is not valid JSON")?;
+            serde_json::to_value(delegation_matrix::start(&home, request)?)?
+        }
+        DelegateCommand::MatrixStatus { matrix_id, collect } => {
+            if collect {
+                serde_json::to_value(delegation_matrix::reconcile(&home, &matrix_id)?)?
+            } else {
+                serde_json::to_value(delegation_matrix::status(&home, &matrix_id)?)?
+            }
+        }
+    };
+    println!("{}", serde_json::to_string(&status)?);
+    Ok(())
 }
 
 fn run_vacuum_command() -> Result<()> {

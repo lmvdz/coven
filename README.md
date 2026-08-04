@@ -249,6 +249,7 @@ The full command surface — every subcommand, flag, and JSON output shape — l
 | `coven attach <id>` | Replay/follow session output and forward input | [`cli-attach.md`](docs/reference/cli-attach.md) |
 | `coven archive` / `summon` / `sacrifice` / `kill` | Session rituals (see below) | [`cli-archive.md`](docs/reference/cli-archive.md), [`cli-summon.md`](docs/reference/cli-summon.md), [`cli-sacrifice.md`](docs/reference/cli-sacrifice.md), [`cli-kill.md`](docs/reference/cli-kill.md) |
 | `coven adapter list/doctor/install` | Inspect harness adapters; opt into trusted adapter recipes (e.g. `coven adapter install grok`) | [`docs/HARNESS-ADAPTERS.md`](docs/HARNESS-ADAPTERS.md) |
+| `coven delegate start/status/integrate/cancel` | Run and explicitly accept or discard an asynchronous remote child | [`cli-delegate.md`](docs/reference/cli-delegate.md) |
 | `coven status` / `familiars` / `skills` / `research` / `calls` / `hub` | Read-only observability with `--json`, mirroring the daemon API routes | [`cli-observe.md`](docs/reference/cli-observe.md) |
 | `coven memory` / `coven memory --json` / `coven memory open` | Preserve the memory list output or launch the private loopback dashboard | [`cli-observe.md`](docs/reference/cli-observe.md) |
 | `coven memory import` / `coven memory restore` | Preview, apply, verify, and logically restore one familiar's memory migration | [`memory-import.md`](docs/help/memory-import.md) |
@@ -521,7 +522,7 @@ No. Coven wraps them. You still use the harness CLI for its AI capabilities — 
 
 **Q: Does Coven require an internet connection or an account?**
 
-No. Coven itself is fully local. Your harness CLIs (Codex, Claude Code) require their own provider authentication, but Coven stores no credentials and makes no outbound network calls.
+No. Coven is local by default. Opt-in fleet executors make authenticated outbound requests to their configured hub. Harness CLIs require their own provider authentication, and provider traffic and credentials remain owned by the executor-local harness.
 
 **Q: Is Windows supported?**
 

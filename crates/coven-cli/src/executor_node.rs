@@ -193,6 +193,7 @@ pub fn build_transport(config: &TransportConfig) -> Result<Box<dyn ExecutorTrans
 /// closed on unknown host keys so node identity stays pinned to the
 /// operator-managed `known_hosts`.
 pub struct SshTransport {
+    ssh_program: String,
     host: String,
     user: Option<String>,
     port: Option<u16>,
@@ -229,6 +230,7 @@ impl SshTransport {
             bail!("ssh transport remote program must not be empty or start with '-'");
         }
         Ok(Self {
+            ssh_program: "ssh".into(),
             host: host.to_string(),
             user: user.map(str::to_string),
             port,
@@ -239,7 +241,7 @@ impl SshTransport {
 
     pub fn argv(&self, protocol_args: &[&str]) -> Vec<String> {
         let mut argv = vec![
-            "ssh".to_string(),
+            self.ssh_program.clone(),
             "-o".to_string(),
             "BatchMode=yes".to_string(),
             "-o".to_string(),
@@ -262,6 +264,12 @@ impl SshTransport {
         argv.push(self.remote_program.clone());
         argv.extend(protocol_args.iter().map(|arg| arg.to_string()));
         argv
+    }
+
+    #[cfg(test)]
+    fn with_ssh_program(mut self, program: impl Into<String>) -> Self {
+        self.ssh_program = program.into();
+        self
     }
 }
 
@@ -924,7 +932,7 @@ mod tests {
             "executor.internal",
             Some("coven"),
             Some(2222),
-            Some("/home/coven/.ssh/id_ed25519"),
+            Some("/srv/coven-identity/id_ed25519"),
             None,
         )?;
 
@@ -943,7 +951,7 @@ mod tests {
                 "-p",
                 "2222",
                 "-i",
-                "/home/coven/.ssh/id_ed25519",
+                "/srv/coven-identity/id_ed25519",
                 "coven@executor.internal",
                 "coven",
                 "executor",
@@ -964,6 +972,59 @@ mod tests {
         assert!(SshTransport::new("host", Some("  "), None, None, None).is_err());
         assert!(SshTransport::new("host", None, None, Some("  "), None).is_err());
         assert!(SshTransport::new("host", None, None, None, Some("  ")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_ssh_and_direct_pull_share_the_normalized_result_contract() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let shim = temp.path().join("executor-shim");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"protocolVersion\":\"coven.executor.v1\",\"jobId\":\"transport-parity\",\"status\":\"completed\",\"exitCode\":0,\"stdout\":\"parity\\n\",\"stderr\":\"\",\"startedAt\":\"2026-08-04T00:00:00Z\",\"finishedAt\":\"2026-08-04T00:00:00Z\",\"durationMs\":0,\"error\":null}'\n",
+        )?;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700))?;
+        let job = ExecutorJob {
+            protocol_version: EXECUTOR_PROTOCOL_VERSION.into(),
+            job_id: "transport-parity".into(),
+            hub_id: None,
+            required_capabilities: vec!["shell".into()],
+            command: shell_command("printf 'parity\\n'"),
+            cwd: None,
+            env: BTreeMap::new(),
+            stdin: None,
+            timeout_seconds: Some(10),
+            context: None,
+        };
+        let local = dispatch_job(
+            &LocalProcessTransport {
+                program: shim.to_string_lossy().into_owned(),
+                args: vec![],
+            },
+            &job,
+        );
+        let ssh = dispatch_job(
+            &SshTransport::new("executor.internal", None, None, None, Some("coven"))?
+                .with_ssh_program(shim.to_string_lossy()),
+            &job,
+        );
+        let pull = run_job(&job);
+        let projection = |result: &ExecutorResultEnvelope| {
+            serde_json::json!({
+                "protocolVersion": result.protocol_version,
+                "jobId": result.job_id,
+                "status": result.status,
+                "exitCode": result.exit_code,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "error": result.error,
+            })
+        };
+        assert_eq!(projection(&local), projection(&ssh));
+        assert_eq!(projection(&local), projection(&pull));
+        Ok(())
     }
 
     #[test]
