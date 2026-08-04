@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
-#[cfg(unix)]
 use std::io::Read;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};

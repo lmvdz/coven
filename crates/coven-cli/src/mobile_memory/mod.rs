@@ -17,8 +17,12 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use chrono::DateTime;
+use chrono::Utc;
+#[cfg(unix)]
+use serde::Deserialize;
+use serde::Serialize;
 use url::Url;
 use uuid::Uuid;
 
