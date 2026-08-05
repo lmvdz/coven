@@ -124,6 +124,8 @@ pub struct HealthCapabilities {
     pub scheduler: bool,
     pub hub: bool,
     pub executor_dispatch: bool,
+    pub fleet_trust: bool,
+    pub fleet_discovery: bool,
     pub event_cursor: String,
     pub structured_errors: bool,
     pub session_handoff: bool,
@@ -372,6 +374,8 @@ pub(crate) fn health_response_for_authority(
             scheduler: true,
             hub: true,
             executor_dispatch: true,
+            fleet_trust: true,
+            fleet_discovery: true,
             event_cursor: "sequence".to_string(),
             structured_errors: true,
             session_handoff: true,
@@ -767,6 +771,68 @@ pub(crate) fn handle_request_with_runtime_and_authority(
         }
         ("POST", "/scheduler/redispatch") => {
             hub_mutation_response(coven_home, || scheduler_redispatch(coven_home, body))
+        }
+        ("GET", "/discovery/advertisement") => crate::fleet::advertisement(coven_home),
+        ("POST", "/discovery/negotiate") => crate::fleet::negotiate(body),
+        ("POST", "/fleet/enrollment-credentials") => {
+            crate::fleet::create_enrollment(coven_home, body)
+        }
+        ("POST", "/fleet/enroll") => crate::fleet::enroll(coven_home, body),
+        ("POST", "/fleet/pairing-requests") => crate::fleet::request_pairing(coven_home, body),
+        ("GET", "/fleet/pairing-requests") => crate::fleet::list_pairing_requests(coven_home),
+        ("POST", path)
+            if path.starts_with("/fleet/pairing-requests/") && path.ends_with("/approve") =>
+        {
+            crate::fleet::decide_pairing(
+                coven_home,
+                path.trim_start_matches("/fleet/pairing-requests/")
+                    .trim_end_matches("/approve"),
+                true,
+            )
+        }
+        ("POST", path)
+            if path.starts_with("/fleet/pairing-requests/") && path.ends_with("/deny") =>
+        {
+            crate::fleet::decide_pairing(
+                coven_home,
+                path.trim_start_matches("/fleet/pairing-requests/")
+                    .trim_end_matches("/deny"),
+                false,
+            )
+        }
+        ("POST", path)
+            if path.starts_with("/fleet/pairing-requests/") && path.ends_with("/claim") =>
+        {
+            crate::fleet::claim_pairing(
+                coven_home,
+                path.trim_start_matches("/fleet/pairing-requests/")
+                    .trim_end_matches("/claim"),
+                body,
+            )
+        }
+        ("POST", "/fleet/local-credentials") => {
+            crate::fleet::store_local_credential(coven_home, body)
+        }
+        ("POST", path)
+            if path.starts_with("/fleet/local-credentials/") && path.ends_with("/proof") =>
+        {
+            crate::fleet::local_proof(
+                coven_home,
+                path.trim_start_matches("/fleet/local-credentials/")
+                    .trim_end_matches("/proof"),
+                body,
+            )
+        }
+        ("POST", "/fleet/challenges") => crate::fleet::create_challenge(coven_home, body),
+        ("POST", "/fleet/reconnect") => crate::fleet::reconnect(coven_home, body),
+        ("GET", "/fleet/trusted-nodes") => crate::fleet::list_trusted_nodes(coven_home),
+        ("POST", path)
+            if path.starts_with("/fleet/trusted-nodes/") && path.ends_with("/revoke") =>
+        {
+            let node_id = path
+                .trim_start_matches("/fleet/trusted-nodes/")
+                .trim_end_matches("/revoke");
+            crate::fleet::revoke(coven_home, node_id)
         }
         ("GET", "/hub/status") => crate::hub::hub_status(coven_home),
         ("POST", "/hub/nodes") => {

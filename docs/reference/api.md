@@ -28,7 +28,31 @@ flowchart LR
   Root --> Hub["/hub"]
 ```
 
-All error responses use the structured envelope documented in the [API contract](/API-CONTRACT#structured-error-envelope): `{ "error": { "code", "message", "details" } }`. Unknown routes, action ids, and API versions fail closed. Clients negotiate the named `coven.daemon.v1` contract with `GET /api/v1/health`, then check every capability required by the operation. Boolean operation-group flags (`sessions`, `events`, `travel`, `scheduler`, `hub`, `executorDispatch`, `sessionHandoff`, `sessionLaunchPolicy`, `afs`, `afsCommit`, `afsCommitDryRun`) are advertised in the health `capabilities` block — treat a group as unavailable unless health advertises it. Capabilities advertise availability and never grant permission.
+All error responses use the structured envelope documented in the [API contract](/API-CONTRACT#structured-error-envelope): `{ "error": { "code", "message", "details" } }`. Unknown routes, action ids, and API versions fail closed. Clients negotiate the named `coven.daemon.v1` contract with `GET /api/v1/health`, then check every capability required by the operation. Boolean operation-group flags (`sessions`, `events`, `travel`, `scheduler`, `hub`, `executorDispatch`, `sessionHandoff`, `sessionLaunchPolicy`, `afs`, `afsCommit`, `afsCommitDryRun`, `fleetTrust`, `fleetDiscovery`) are advertised in the health `capabilities` block — treat a group as unavailable unless health advertises it. Capabilities advertise availability and never grant permission.
+
+## Fleet trust and discovery
+
+The [fleet trust model](/FLEET-TRUST) defines the authority and disclosure
+boundary. Tailscale is transport and bounded peer inventory, never
+authorization.
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| GET | `/api/v1/discovery/advertisement` | Minimal untrusted service/version/pairing probe. |
+| POST | `/api/v1/discovery/negotiate` | Select a mutually supported protocol or fail closed. |
+| POST | `/api/v1/fleet/enrollment-credentials` | Create a single-use credential (`ttlSeconds`, maximum 600). |
+| POST | `/api/v1/fleet/enroll` | Atomically redeem enrollment and return the node credential once. |
+| POST | `/api/v1/fleet/pairing-requests` | Request explicit approval; returns a private request secret once. |
+| GET | `/api/v1/fleet/pairing-requests` | List minimal pending requests for local Cave approval. |
+| POST | `/api/v1/fleet/pairing-requests/:id/approve` | Idempotently approve a pending request. |
+| POST | `/api/v1/fleet/pairing-requests/:id/deny` | Idempotently deny a pending request. |
+| POST | `/api/v1/fleet/pairing-requests/:id/claim` | Claim an approved request once using its private secret. |
+| POST | `/api/v1/fleet/local-credentials` | Store a delivered credential in executor-local custody. |
+| POST | `/api/v1/fleet/local-credentials/:hubId/proof` | Derive a reconnect proof without returning the credential. |
+| POST | `/api/v1/fleet/challenges` | Create a 60-second, single-use challenge for a trusted node. |
+| POST | `/api/v1/fleet/reconnect` | Authenticate a node id, nonce, and derived proof. |
+| GET | `/api/v1/fleet/trusted-nodes` | List trust lifecycle metadata; never credential hashes. |
+| POST | `/api/v1/fleet/trusted-nodes/:id/revoke` | Idempotently revoke durable trust. |
 
 ## Contract and discovery
 

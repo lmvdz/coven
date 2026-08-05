@@ -32,6 +32,7 @@ mod eval_loop;
 mod event_writer;
 mod executor_node;
 mod familiar_identity;
+mod fleet;
 mod handoff;
 mod harness;
 /// Public at the crate root so every adapter entrypoint shares one contract

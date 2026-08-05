@@ -55,6 +55,8 @@ proof of `coven.daemon.v1` support.
     "scheduler": true,
     "hub": true,
     "executorDispatch": true,
+    "fleetTrust": true,
+    "fleetDiscovery": true,
     "eventCursor": "sequence",
     "structuredErrors": true,
     "sessionHandoff": true,
@@ -1267,4 +1269,46 @@ Shared non-success responses use the structured error envelope:
 
 ## Scope boundary
 
-The `coven.daemon.v1` contract covers daemon health, capability discovery, action routing, sessions, events, live input, live kill, travel-mode profile/delta reconciliation, and scheduler decision/recovery routes. Do not treat route names outside this document as reserved API until they are implemented and documented here.
+## Fleet trust and discovery
+
+`fleetDiscovery` advertises a minimal, publishable discovery response at
+`GET /api/v1/discovery/advertisement` and version negotiation at
+`POST /api/v1/discovery/negotiate`. The advertisement contains only
+`service`, `protocolVersions`, and `pairingAvailable`; clients must not infer
+authorization from reachability or tailnet membership.
+
+`fleetTrust` advertises the enrollment/reconnect authority:
+
+- `POST /api/v1/fleet/enrollment-credentials` creates an expiring single-use
+  secret; `ttlSeconds` is constrained to `1..=600`.
+- `POST /api/v1/fleet/enroll` atomically consumes it and returns a durable node
+  credential once.
+- `POST /api/v1/fleet/pairing-requests` creates a five-minute explicit-approval
+  request and returns its private request secret once. Local Cave management
+  lists requests and idempotently approves or denies via `GET
+  /api/v1/fleet/pairing-requests` and `POST .../:id/approve|deny`. The executor
+  uses `POST .../:id/claim` with its secret; approved credentials are delivered
+  once, and denial creates no trust.
+- `POST /api/v1/fleet/local-credentials` stores a delivered credential in the
+  executor's local Coven store. `POST
+  /api/v1/fleet/local-credentials/:hubId/proof` derives the reconnect proof
+  without returning the credential to Cave.
+- `POST /api/v1/fleet/challenges` creates a 60-second single-use reconnect
+  nonce for a trusted node.
+- `POST /api/v1/fleet/reconnect` accepts `{ nodeId, nonce, proof }`; the durable
+  credential is not retransmitted.
+- `GET /api/v1/fleet/trusted-nodes` returns lifecycle metadata without secret
+  hashes.
+- `POST /api/v1/fleet/trusted-nodes/:id/revoke` durably and idempotently revokes
+  the node.
+
+Structured failure codes include `fleet_version_mismatch`,
+`enrollment_invalid`, `enrollment_used`, `enrollment_expired`, `node_untrusted`,
+`node_authentication_failed`, `challenge_invalid`, `challenge_used`,
+`challenge_expired`, `node_revoked`, `pairing_request_not_found`,
+`pairing_request_expired`, `pairing_request_unauthorized`,
+`pairing_request_denied`, `pairing_request_decided`,
+`pairing_credential_delivered`, and `local_credential_not_found`. See [Fleet trust and discovery](FLEET-TRUST.md)
+for disclosure and threat-model requirements.
+
+The `coven.daemon.v1` contract covers daemon health, capability discovery, action routing, sessions, events, live input, live kill, travel-mode profile/delta reconciliation, scheduler decision/recovery routes, and fleet trust/discovery. Do not treat route names outside this document as reserved API until they are implemented and documented here.
