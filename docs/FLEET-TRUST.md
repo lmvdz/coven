@@ -33,6 +33,7 @@ untrusted probe. It discloses:
 
 - the constant service name;
 - supported protocol versions; and
+- configured local fleet roles (`hub`, `executor`, or `both`); and
 - whether an administrator has opened a short enrollment window.
 
 It never discloses hub or node identity, device names, users, paths, registry
@@ -87,3 +88,18 @@ alone is never evidence of trust.
 This first protocol version uses a shared-secret challenge proof. A later
 version may negotiate public-key device identity without changing the rule that
 tailnet membership is transport context, never authorization.
+
+## Local role, lifecycle, and sharing
+
+The local daemon exposes a stable device id and persisted desired state at
+`GET /api/v1/fleet/local-node`. Cave configures `hub`, `executor`, or `both`
+through `PUT /fleet/local-node/role`. Fleet lifecycle actions are desired-state
+operations: `start`, `stop`, `drain`, and `resume` are safe to repeat. `restart`
+requires an `operationId`; replaying the same id returns the current state
+without applying a second restart, while reusing it for another action fails.
+
+Executor sharing is off by default and can be enabled only for `executor` or
+`both`. The executor probe derives availability from the authoritative state:
+it advertises available only while the fleet service is running, sharing is
+enabled, and the local role includes executor. Draining immediately rejects new
+dispatch while an already-running stateless job is allowed to finish.

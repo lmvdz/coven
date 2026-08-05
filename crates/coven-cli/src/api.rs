@@ -778,6 +778,18 @@ pub(crate) fn handle_request_with_runtime_and_authority(
             crate::fleet::create_enrollment(coven_home, body)
         }
         ("POST", "/fleet/enroll") => crate::fleet::enroll(coven_home, body),
+        ("GET", "/fleet/local-node") => crate::fleet::local_node_status(coven_home),
+        ("PUT", "/fleet/local-node/role") => crate::fleet::configure_local_role(coven_home, body),
+        ("PUT", "/fleet/local-node/sharing") => {
+            crate::fleet::configure_local_sharing(coven_home, body)
+        }
+        ("POST", path) if path.starts_with("/fleet/local-node/lifecycle/") => {
+            crate::fleet::local_lifecycle(
+                coven_home,
+                path.trim_start_matches("/fleet/local-node/lifecycle/"),
+                body,
+            )
+        }
         ("POST", "/fleet/pairing-requests") => crate::fleet::request_pairing(coven_home, body),
         ("GET", "/fleet/pairing-requests") => crate::fleet::list_pairing_requests(coven_home),
         ("POST", path)

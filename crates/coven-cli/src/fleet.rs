@@ -52,10 +52,314 @@ fn open(home: &Path) -> Result<Connection> {
          CREATE TABLE IF NOT EXISTS fleet_local_credentials (
             hub_id TEXT PRIMARY KEY NOT NULL, node_id TEXT NOT NULL,
             node_credential TEXT NOT NULL, stored_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS fleet_local_node (
+            singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton=1),
+            device_id TEXT NOT NULL, role TEXT NOT NULL,
+            lifecycle TEXT NOT NULL, executor_shared INTEGER NOT NULL,
+            capabilities_json TEXT NOT NULL, generation INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS fleet_lifecycle_operations (
+            operation_id TEXT PRIMARY KEY NOT NULL, action TEXT NOT NULL,
+            created_at TEXT NOT NULL
          );",
     )
     .context("failed to initialize fleet trust schema")?;
     Ok(conn)
+}
+
+const ROLE_HUB: &str = "hub";
+const ROLE_EXECUTOR: &str = "executor";
+const ROLE_BOTH: &str = "both";
+const LIFECYCLE_STOPPED: &str = "stopped";
+const LIFECYCLE_RUNNING: &str = "running";
+const LIFECYCLE_DRAINING: &str = "draining";
+
+#[derive(Debug)]
+struct LocalNode {
+    device_id: String,
+    role: String,
+    lifecycle: String,
+    executor_shared: bool,
+    capabilities_json: String,
+    generation: i64,
+    updated_at: String,
+}
+
+fn load_or_create_local_node(conn: &Connection) -> Result<LocalNode> {
+    let existing = conn
+        .query_row(
+            "SELECT device_id, role, lifecycle, executor_shared, capabilities_json,
+                    generation, updated_at FROM fleet_local_node WHERE singleton=1",
+            [],
+            |row| {
+                Ok(LocalNode {
+                    device_id: row.get(0)?,
+                    role: row.get(1)?,
+                    lifecycle: row.get(2)?,
+                    executor_shared: row.get(3)?,
+                    capabilities_json: row.get(4)?,
+                    generation: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    if let Some(node) = existing {
+        return Ok(node);
+    }
+    let node = LocalNode {
+        device_id: format!("node_{}", Uuid::new_v4().simple()),
+        role: ROLE_HUB.to_string(),
+        lifecycle: LIFECYCLE_STOPPED.to_string(),
+        executor_shared: false,
+        capabilities_json: "[]".to_string(),
+        generation: 0,
+        updated_at: Utc::now().to_rfc3339(),
+    };
+    conn.execute(
+        "INSERT INTO fleet_local_node
+         (singleton, device_id, role, lifecycle, executor_shared, capabilities_json,
+          generation, updated_at) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            node.device_id,
+            node.role,
+            node.lifecycle,
+            node.executor_shared,
+            node.capabilities_json,
+            node.generation,
+            node.updated_at
+        ],
+    )?;
+    Ok(node)
+}
+
+fn role_has_executor(role: &str) -> bool {
+    role == ROLE_EXECUTOR || role == ROLE_BOTH
+}
+
+fn local_node_response(node: &LocalNode) -> Value {
+    let capabilities: Vec<String> =
+        serde_json::from_str(&node.capabilities_json).unwrap_or_default();
+    let accepting_jobs = role_has_executor(&node.role)
+        && node.executor_shared
+        && node.lifecycle == LIFECYCLE_RUNNING;
+    let next_action = match node.lifecycle.as_str() {
+        LIFECYCLE_STOPPED => "start",
+        LIFECYCLE_DRAINING => "resume-or-stop",
+        _ if role_has_executor(&node.role) && !node.executor_shared => "enable-sharing",
+        _ => "none",
+    };
+    json!({
+        "deviceId": node.device_id,
+        "role": node.role,
+        "lifecycle": node.lifecycle,
+        "executorShared": node.executor_shared,
+        "capabilities": capabilities,
+        "acceptingJobs": accepting_jobs,
+        "generation": node.generation,
+        "updatedAt": node.updated_at,
+        "nextAction": next_action
+    })
+}
+
+pub fn local_node_status(home: &Path) -> Result<ApiResponse> {
+    let conn = open(home)?;
+    let node = load_or_create_local_node(&conn)?;
+    json_response(200, &local_node_response(&node))
+}
+
+#[derive(Deserialize)]
+struct ConfigureRole {
+    role: String,
+    #[serde(default)]
+    capabilities: Vec<String>,
+}
+
+pub fn configure_local_role(home: &Path, body: Option<&str>) -> Result<ApiResponse> {
+    let request: ConfigureRole = match parse(body) {
+        Ok(value) => value,
+        Err(response) => return Ok(response),
+    };
+    if ![ROLE_HUB, ROLE_EXECUTOR, ROLE_BOTH].contains(&request.role.as_str()) {
+        return api_error(
+            400,
+            "invalid_fleet_role",
+            "role must be hub, executor, or both.",
+            Some(json!({"supported": [ROLE_HUB, ROLE_EXECUTOR, ROLE_BOTH]})),
+        );
+    }
+    let conn = open(home)?;
+    let mut node = load_or_create_local_node(&conn)?;
+    node.role = request.role;
+    node.capabilities_json = serde_json::to_string(&request.capabilities)?;
+    if !role_has_executor(&node.role) {
+        node.executor_shared = false;
+        if node.lifecycle == LIFECYCLE_DRAINING {
+            node.lifecycle = LIFECYCLE_RUNNING.to_string();
+        }
+    }
+    node.updated_at = Utc::now().to_rfc3339();
+    persist_local_node(&conn, &node)?;
+    json_response(200, &local_node_response(&node))
+}
+
+#[derive(Deserialize)]
+struct SharingRequest {
+    enabled: bool,
+}
+
+pub fn configure_local_sharing(home: &Path, body: Option<&str>) -> Result<ApiResponse> {
+    let request: SharingRequest = match parse(body) {
+        Ok(value) => value,
+        Err(response) => return Ok(response),
+    };
+    let conn = open(home)?;
+    let mut node = load_or_create_local_node(&conn)?;
+    if request.enabled && !role_has_executor(&node.role) {
+        return api_error(
+            409,
+            "executor_role_required",
+            "Choose executor or both before enabling executor sharing.",
+            Some(json!({"currentRole": node.role, "nextAction": "configure-role"})),
+        );
+    }
+    node.executor_shared = request.enabled;
+    node.updated_at = Utc::now().to_rfc3339();
+    persist_local_node(&conn, &node)?;
+    json_response(200, &local_node_response(&node))
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LifecycleRequest {
+    #[serde(default)]
+    operation_id: Option<String>,
+}
+
+pub fn local_lifecycle(home: &Path, action: &str, body: Option<&str>) -> Result<ApiResponse> {
+    let request = if body.is_some() {
+        match parse::<LifecycleRequest>(body) {
+            Ok(value) => value,
+            Err(response) => return Ok(response),
+        }
+    } else {
+        LifecycleRequest::default()
+    };
+    let conn = open(home)?;
+    let mut node = load_or_create_local_node(&conn)?;
+    if action == "restart" && request.operation_id.as_deref().is_none_or(str::is_empty) {
+        return api_error(
+            400,
+            "operation_id_required",
+            "Restart requires operationId so retries are idempotent.",
+            Some(json!({"action": action})),
+        );
+    }
+    if let Some(operation_id) = request.operation_id.as_deref() {
+        let prior: Option<String> = conn
+            .query_row(
+                "SELECT action FROM fleet_lifecycle_operations WHERE operation_id=?1",
+                [operation_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(prior_action) = prior {
+            if prior_action != action {
+                return api_error(
+                    409,
+                    "operation_id_conflict",
+                    "operationId was already used for a different lifecycle action.",
+                    Some(json!({"operationId": operation_id, "priorAction": prior_action})),
+                );
+            }
+            return json_response(200, &local_node_response(&node));
+        }
+    }
+    match action {
+        "start" => node.lifecycle = LIFECYCLE_RUNNING.to_string(),
+        "stop" => node.lifecycle = LIFECYCLE_STOPPED.to_string(),
+        "restart" => {
+            node.lifecycle = LIFECYCLE_RUNNING.to_string();
+            node.generation += 1;
+        }
+        "drain" => {
+            if !role_has_executor(&node.role) {
+                return api_error(
+                    409,
+                    "executor_role_required",
+                    "Only an executor can drain work.",
+                    Some(json!({"currentRole": node.role, "nextAction": "configure-role"})),
+                );
+            }
+            node.lifecycle = LIFECYCLE_DRAINING.to_string();
+        }
+        "resume" => node.lifecycle = LIFECYCLE_RUNNING.to_string(),
+        _ => {
+            return api_error(
+                404,
+                "fleet_lifecycle_action_not_found",
+                "Fleet lifecycle action was not found.",
+                Some(json!({"action": action})),
+            )
+        }
+    }
+    node.updated_at = Utc::now().to_rfc3339();
+    persist_local_node(&conn, &node)?;
+    if let Some(operation_id) = request.operation_id {
+        conn.execute(
+            "INSERT INTO fleet_lifecycle_operations (operation_id, action, created_at)
+             VALUES (?1, ?2, ?3)",
+            params![operation_id, action, Utc::now().to_rfc3339()],
+        )?;
+    }
+    json_response(200, &local_node_response(&node))
+}
+
+fn persist_local_node(conn: &Connection, node: &LocalNode) -> Result<()> {
+    conn.execute(
+        "UPDATE fleet_local_node SET role=?1, lifecycle=?2, executor_shared=?3,
+         capabilities_json=?4, generation=?5, updated_at=?6 WHERE singleton=1",
+        params![
+            node.role,
+            node.lifecycle,
+            node.executor_shared,
+            node.capabilities_json,
+            node.generation,
+            node.updated_at
+        ],
+    )?;
+    Ok(())
+}
+
+/// Executor-side projection of the configured fleet policy. `None` preserves
+/// the pre-fleet headless defaults until a user explicitly configures roles in
+/// Cave or through the API.
+pub(crate) fn executor_policy(home: &Path) -> Result<Option<(Vec<String>, bool)>> {
+    let conn = open(home)?;
+    let node = conn
+        .query_row(
+            "SELECT role, lifecycle, executor_shared, capabilities_json
+             FROM fleet_local_node WHERE singleton=1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((role, lifecycle, shared, capabilities_json)) = node else {
+        return Ok(None);
+    };
+    let capabilities = serde_json::from_str(&capabilities_json)
+        .context("failed to parse local fleet capabilities")?;
+    let available = role_has_executor(&role) && shared && lifecycle == LIFECYCLE_RUNNING;
+    Ok(Some((capabilities, available)))
 }
 
 fn secret(prefix: &str) -> String {
@@ -97,6 +401,7 @@ fn parse_time(value: &str) -> Result<DateTime<Utc>> {
 
 pub fn advertisement(home: &Path) -> Result<ApiResponse> {
     let conn = open(home)?;
+    let local = load_or_create_local_node(&conn)?;
     let pairing_available: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM fleet_enrollments WHERE used_at IS NULL AND expires_at > ?1)",
         [Utc::now().to_rfc3339()],
@@ -109,7 +414,7 @@ pub fn advertisement(home: &Path) -> Result<ApiResponse> {
         200,
         &json!({
             "service": "coven-fleet", "protocolVersions": [PROTOCOL],
-            "pairingAvailable": pairing_available
+            "roles": [local.role], "pairingAvailable": pairing_available
         }),
     )
 }
@@ -702,7 +1007,7 @@ mod tests {
         let value = body(advertisement(home.path())?);
         assert_eq!(
             value,
-            json!({"service":"coven-fleet","protocolVersions":[PROTOCOL],"pairingAvailable":false})
+            json!({"service":"coven-fleet","protocolVersions":[PROTOCOL],"roles":["hub"],"pairingAvailable":false})
         );
         Ok(())
     }
@@ -851,6 +1156,127 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn role_lifecycle_and_sharing_are_idempotent_and_actionable() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let initial = body(local_node_status(home.path())?);
+        assert_eq!(initial["role"], "hub");
+        assert_eq!(initial["lifecycle"], "stopped");
+        assert_eq!(initial["nextAction"], "start");
+        let device_id = initial["deviceId"].as_str().unwrap().to_string();
+
+        let rejected = body(configure_local_sharing(
+            home.path(),
+            Some(r#"{"enabled":true}"#),
+        )?);
+        assert_eq!(rejected["error"]["code"], "executor_role_required");
+
+        let configured = body(configure_local_role(
+            home.path(),
+            Some(r#"{"role":"both","capabilities":["shell","browser"]}"#),
+        )?);
+        assert_eq!(configured["deviceId"], device_id);
+        assert_eq!(configured["role"], "both");
+        assert_eq!(configured["capabilities"], json!(["shell", "browser"]));
+
+        let shared = body(configure_local_sharing(
+            home.path(),
+            Some(r#"{"enabled":true}"#),
+        )?);
+        assert_eq!(shared["executorShared"], true);
+        assert_eq!(shared["acceptingJobs"], false);
+        assert!(!crate::executor_node::build_probe(home.path())?.available);
+
+        let started = body(local_lifecycle(home.path(), "start", None)?);
+        assert_eq!(started["lifecycle"], "running");
+        assert_eq!(started["acceptingJobs"], true);
+        assert!(crate::executor_node::build_probe(home.path())?.available);
+        assert_eq!(
+            crate::executor_node::build_probe(home.path())?.capabilities,
+            vec!["shell", "browser"]
+        );
+        assert_eq!(local_lifecycle(home.path(), "start", None)?.status, 200);
+
+        let drained = body(local_lifecycle(home.path(), "drain", None)?);
+        assert_eq!(drained["lifecycle"], "draining");
+        assert_eq!(drained["acceptingJobs"], false);
+        assert!(!crate::executor_node::build_probe(home.path())?.available);
+        assert_eq!(local_lifecycle(home.path(), "drain", None)?.status, 200);
+
+        let resumed = body(local_lifecycle(home.path(), "resume", None)?);
+        assert_eq!(resumed["acceptingJobs"], true);
+        assert_eq!(local_lifecycle(home.path(), "restart", None)?.status, 400);
+        let operation = Some(r#"{"operationId":"restart-1"}"#);
+        let restarted = body(local_lifecycle(home.path(), "restart", operation)?);
+        assert_eq!(restarted["generation"], 1);
+        let restarted_again = body(local_lifecycle(home.path(), "restart", operation)?);
+        assert_eq!(restarted_again["generation"], 1);
+
+        let stopped = body(local_lifecycle(home.path(), "stop", None)?);
+        assert_eq!(stopped["lifecycle"], "stopped");
+        assert_eq!(stopped["acceptingJobs"], false);
+        assert!(!crate::executor_node::build_probe(home.path())?.available);
+        assert_eq!(local_lifecycle(home.path(), "stop", None)?.status, 200);
+        Ok(())
+    }
+
+    #[test]
+    fn versioned_router_exposes_every_cave_lifecycle_operation() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let request = |method, path, payload| {
+            crate::api::handle_request_with_body(method, path, home.path(), None, payload)
+        };
+        assert_eq!(
+            request("GET", "/api/v1/fleet/local-node", None)?.status,
+            200
+        );
+        assert_eq!(
+            request(
+                "PUT",
+                "/api/v1/fleet/local-node/role",
+                Some(r#"{"role":"executor","capabilities":["shell"]}"#)
+            )?
+            .status,
+            200
+        );
+        assert_eq!(
+            request(
+                "PUT",
+                "/api/v1/fleet/local-node/sharing",
+                Some(r#"{"enabled":true}"#)
+            )?
+            .status,
+            200
+        );
+        for action in ["start", "drain", "resume", "stop"] {
+            let route = format!("/api/v1/fleet/local-node/lifecycle/{action}");
+            assert_eq!(
+                crate::api::handle_request_with_body("POST", &route, home.path(), None, None)?
+                    .status,
+                200
+            );
+        }
+        assert_eq!(
+            request(
+                "POST",
+                "/api/v1/fleet/local-node/lifecycle/restart",
+                Some(r#"{"operationId":"router-restart"}"#)
+            )?
+            .status,
+            200
+        );
+        assert_eq!(
+            request(
+                "POST",
+                "/api/v1/fleet/local-node/lifecycle/restart",
+                Some(r#"{"operationId":"router-restart"}"#)
+            )?
+            .status,
+            200
+        );
         Ok(())
     }
 

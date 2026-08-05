@@ -42,6 +42,10 @@ authorization.
 | POST | `/api/v1/discovery/negotiate` | Select a mutually supported protocol or fail closed. |
 | POST | `/api/v1/fleet/enrollment-credentials` | Create a single-use credential (`ttlSeconds`, maximum 600). |
 | POST | `/api/v1/fleet/enroll` | Atomically redeem enrollment and return the node credential once. |
+| GET | `/api/v1/fleet/local-node` | Inspect stable identity, role, lifecycle, sharing, capabilities, and actionable next state. |
+| PUT | `/api/v1/fleet/local-node/role` | Configure `hub`, `executor`, or `both` plus advertised capabilities. |
+| PUT | `/api/v1/fleet/local-node/sharing` | Idempotently enable/disable executor sharing. |
+| POST | `/api/v1/fleet/local-node/lifecycle/:action` | Start, stop, drain, resume, or operation-idempotent restart. |
 | POST | `/api/v1/fleet/pairing-requests` | Request explicit approval; returns a private request secret once. |
 | GET | `/api/v1/fleet/pairing-requests` | List minimal pending requests for local Cave approval. |
 | POST | `/api/v1/fleet/pairing-requests/:id/approve` | Idempotently approve a pending request. |

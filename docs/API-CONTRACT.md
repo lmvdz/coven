@@ -1283,6 +1283,15 @@ authorization from reachability or tailnet membership.
   secret; `ttlSeconds` is constrained to `1..=600`.
 - `POST /api/v1/fleet/enroll` atomically consumes it and returns a durable node
   credential once.
+- `GET /api/v1/fleet/local-node` returns the stable local device id, configured
+  role (`hub`, `executor`, or `both`), lifecycle (`stopped`, `running`, or
+  `draining`), sharing policy, capabilities, executor availability, generation,
+  and an actionable `nextAction`. `PUT .../role` and `PUT .../sharing` are
+  idempotent desired-state mutations. `POST .../lifecycle/:action` supports
+  `start`, `stop`, `drain`, `resume`, and `restart`; restart requires an
+  `operationId`, whose replay is idempotent and whose cross-action reuse is a
+  conflict. Executor probe availability is derived from this state, so stopped,
+  draining, hub-only, and unshared nodes cannot receive new jobs.
 - `POST /api/v1/fleet/pairing-requests` creates a five-minute explicit-approval
   request and returns its private request secret once. Local Cave management
   lists requests and idempotently approves or denies via `GET

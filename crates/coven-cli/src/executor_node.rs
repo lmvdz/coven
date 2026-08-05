@@ -495,17 +495,19 @@ pub fn build_probe(coven_home: &Path) -> Result<ExecutorProbe> {
             "executor role must be `{ROLE_STATIONARY_EXECUTOR}` or `{ROLE_COMPUTE_EXECUTOR}`, got `{role}`"
         );
     }
-    let capabilities = config.capabilities.unwrap_or_else(|| {
+    let configured_capabilities = config.capabilities.unwrap_or_else(|| {
         DEFAULT_EXECUTOR_CAPABILITIES
             .iter()
             .map(|capability| capability.to_string())
             .collect()
     });
+    let fleet_policy = crate::fleet::executor_policy(coven_home)?;
+    let (capabilities, available) = fleet_policy.unwrap_or((configured_capabilities, true));
     Ok(ExecutorProbe {
         protocol_version: EXECUTOR_PROTOCOL_VERSION.to_string(),
         role,
         capabilities,
-        available: true,
+        available,
         // Stateless executors run dispatched jobs synchronously per
         // connection and hold no durable queue; the hub owns queues.
         queue_pressure: 0,
@@ -920,11 +922,18 @@ mod tests {
 
     #[test]
     fn ssh_transport_builds_batch_mode_pinned_argv() -> Result<()> {
+        let identity = format!(
+            "{}home{}coven{}.ssh{}id_ed25519",
+            std::path::MAIN_SEPARATOR,
+            std::path::MAIN_SEPARATOR,
+            std::path::MAIN_SEPARATOR,
+            std::path::MAIN_SEPARATOR
+        );
         let transport = SshTransport::new(
             "executor.internal",
             Some("coven"),
             Some(2222),
-            Some("/home/coven/.ssh/id_ed25519"),
+            Some(&identity),
             None,
         )?;
 
@@ -943,7 +952,7 @@ mod tests {
                 "-p",
                 "2222",
                 "-i",
-                "/home/coven/.ssh/id_ed25519",
+                identity.as_str(),
                 "coven@executor.internal",
                 "coven",
                 "executor",
