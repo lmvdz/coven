@@ -123,3 +123,21 @@ Cave inspects `tailscale serve status --json` before changing Serve state. It
 claims port 8787 only when unused, treats the exact `127.0.0.1:8787` forward as
 its own idempotent route, refuses to overwrite any other route, and removes only
 that exact owned forward when Fleet stops.
+
+## Executor work
+
+Fleet work preserves the same directional trust established during pairing.
+The hub never calls an administrative endpoint on the executor. Instead, a
+running, shared executor asks the hub for a challenge, derives a proof from its
+locally held node credential, and pulls one job addressed to its stable node
+id. The hub atomically leases that job; a fresh proof is required to return the
+result. Completed and failed results are durable and idempotent. An abandoned
+lease expires so another executor poll can recover it without redispatching a
+job that already reached a terminal state.
+
+The initial Cave surface exposes a bounded system-information job. The executor
+maps that declared job kind to an OS-native command locally, runs it through the
+existing `coven.executor.v1` engine, and returns the normalized envelope. This
+proves authenticated execution and result transport without accepting arbitrary
+commands from an untrusted discovery peer or assuming that Mac workspace paths
+exist on Windows.

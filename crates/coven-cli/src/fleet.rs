@@ -21,6 +21,7 @@ const PROTOCOL: &str = "coven.fleet.v1";
 const MAX_ENROLLMENT_TTL_SECONDS: i64 = 600;
 const DEFAULT_ENROLLMENT_TTL_SECONDS: i64 = 300;
 const CHALLENGE_TTL_SECONDS: i64 = 60;
+const JOB_LEASE_TTL_SECONDS: i64 = 60;
 
 fn store_path(home: &Path) -> std::path::PathBuf {
     home.join("coven.sqlite3")
@@ -63,6 +64,13 @@ fn open(home: &Path) -> Result<Connection> {
          CREATE TABLE IF NOT EXISTS fleet_lifecycle_operations (
             operation_id TEXT PRIMARY KEY NOT NULL, action TEXT NOT NULL,
             created_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS fleet_jobs (
+            job_id TEXT PRIMARY KEY NOT NULL, target_node_id TEXT NOT NULL,
+            spec_json TEXT NOT NULL, state TEXT NOT NULL,
+            lease_id TEXT, result_json TEXT,
+            created_at TEXT NOT NULL, leased_at TEXT, lease_expires_at TEXT,
+            completed_at TEXT
          );",
     )
     .context("failed to initialize fleet trust schema")?;
@@ -984,6 +992,254 @@ pub fn list_trusted_nodes(home: &Path) -> Result<ApiResponse> {
     json_response(200, &json!({ "nodes": nodes }))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueFleetJob {
+    target_node_id: String,
+}
+
+pub fn queue_system_info_job(home: &Path, body: Option<&str>) -> Result<ApiResponse> {
+    let request: QueueFleetJob = match parse(body) {
+        Ok(value) => value,
+        Err(response) => return Ok(response),
+    };
+    let conn = open(home)?;
+    let trusted: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM fleet_trusted_nodes WHERE node_id=?1 AND revoked_at IS NULL)",
+        [&request.target_node_id],
+        |row| row.get(0),
+    )?;
+    if !trusted {
+        return api_error(
+            404,
+            "node_untrusted",
+            "Choose an approved Fleet device.",
+            None,
+        );
+    }
+    let job_id = format!("fleetjob_{}", Uuid::new_v4().simple());
+    let spec = json!({
+        "protocolVersion": crate::executor_node::EXECUTOR_PROTOCOL_VERSION,
+        "jobId": job_id,
+        "hubId": load_or_create_local_node(&conn)?.device_id,
+        "requiredCapabilities": ["shell"],
+        "command": ["coven:fleet-system-info"],
+        "env": {},
+        "context": {"kind": "fleet-system-info"},
+        "timeoutSeconds": 30
+    });
+    let created_at = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO fleet_jobs
+         (job_id, target_node_id, spec_json, state, created_at)
+         VALUES (?1, ?2, ?3, 'queued', ?4)",
+        params![job_id, request.target_node_id, spec.to_string(), created_at],
+    )?;
+    json_response(
+        201,
+        &json!({
+            "jobId": job_id, "targetNodeId": request.target_node_id,
+            "state": "queued", "createdAt": created_at
+        }),
+    )
+}
+
+pub fn list_fleet_jobs(home: &Path) -> Result<ApiResponse> {
+    let conn = open(home)?;
+    let mut statement = conn.prepare(
+        "SELECT job_id, target_node_id, state, result_json, created_at, leased_at, completed_at
+         FROM fleet_jobs ORDER BY created_at DESC LIMIT 50",
+    )?;
+    let jobs = statement
+        .query_map([], |row| {
+            let result: Option<String> = row.get(3)?;
+            Ok(json!({
+                "jobId": row.get::<_, String>(0)?,
+                "targetNodeId": row.get::<_, String>(1)?,
+                "state": row.get::<_, String>(2)?,
+                "result": result.and_then(|value| serde_json::from_str::<Value>(&value).ok()),
+                "createdAt": row.get::<_, String>(4)?,
+                "leasedAt": row.get::<_, Option<String>>(5)?,
+                "completedAt": row.get::<_, Option<String>>(6)?
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<Value>>>()?;
+    json_response(200, &json!({"jobs": jobs}))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthenticatedFleetRequest {
+    node_id: String,
+    nonce: String,
+    proof: String,
+}
+
+fn authenticate_fleet_request(
+    home: &Path,
+    request: &AuthenticatedFleetRequest,
+) -> Result<Option<ApiResponse>> {
+    let body = json!({
+        "nodeId": request.node_id,
+        "nonce": request.nonce,
+        "proof": request.proof
+    })
+    .to_string();
+    let response = reconnect(home, Some(&body))?;
+    Ok((response.status != 200).then_some(response))
+}
+
+pub fn claim_fleet_job(home: &Path, body: Option<&str>) -> Result<ApiResponse> {
+    let request: AuthenticatedFleetRequest = match parse(body) {
+        Ok(value) => value,
+        Err(response) => return Ok(response),
+    };
+    if let Some(response) = authenticate_fleet_request(home, &request)? {
+        return Ok(response);
+    }
+    let mut conn = open(home)?;
+    let tx = conn.transaction()?;
+    let queued: Option<(String, String)> = tx
+        .query_row(
+            "SELECT job_id, spec_json FROM fleet_jobs
+             WHERE target_node_id=?1 AND
+             (state='queued' OR (state='leased' AND lease_expires_at <= ?2))
+             ORDER BY created_at LIMIT 1",
+            params![request.node_id, Utc::now().to_rfc3339()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((job_id, spec_json)) = queued else {
+        tx.commit()?;
+        return json_response(200, &json!({"job": null}));
+    };
+    let lease_id = format!("lease_{}", Uuid::new_v4().simple());
+    let now = Utc::now();
+    let leased_at = now.to_rfc3339();
+    let lease_expires_at = (now + Duration::seconds(JOB_LEASE_TTL_SECONDS)).to_rfc3339();
+    let changed = tx.execute(
+        "UPDATE fleet_jobs SET state='leased', lease_id=?1, leased_at=?2, lease_expires_at=?3
+         WHERE job_id=?4 AND (state='queued' OR (state='leased' AND lease_expires_at <= ?2))",
+        params![lease_id, leased_at, lease_expires_at, job_id],
+    )?;
+    if changed != 1 {
+        tx.commit()?;
+        return json_response(200, &json!({"job": null}));
+    }
+    tx.commit()?;
+    let spec: Value = serde_json::from_str(&spec_json)?;
+    json_response(200, &json!({"job": spec, "leaseId": lease_id}))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompleteFleetJob {
+    node_id: String,
+    nonce: String,
+    proof: String,
+    job_id: String,
+    lease_id: String,
+    result: Value,
+}
+
+pub fn complete_fleet_job(home: &Path, body: Option<&str>) -> Result<ApiResponse> {
+    let request: CompleteFleetJob = match parse(body) {
+        Ok(value) => value,
+        Err(response) => return Ok(response),
+    };
+    let auth = AuthenticatedFleetRequest {
+        node_id: request.node_id.clone(),
+        nonce: request.nonce.clone(),
+        proof: request.proof.clone(),
+    };
+    if let Some(response) = authenticate_fleet_request(home, &auth)? {
+        return Ok(response);
+    }
+    let conn = open(home)?;
+    let current: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT state, lease_id FROM fleet_jobs WHERE job_id=?1 AND target_node_id=?2",
+            params![request.job_id, request.node_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((state, lease_id)) = current else {
+        return api_error(404, "fleet_job_not_found", "Fleet job was not found.", None);
+    };
+    if state == "completed" || state == "failed" {
+        return json_response(200, &json!({"jobId": request.job_id, "state": state}));
+    }
+    if state != "leased" || lease_id.as_deref() != Some(request.lease_id.as_str()) {
+        return api_error(
+            409,
+            "fleet_job_lease_invalid",
+            "Fleet job lease is invalid.",
+            None,
+        );
+    }
+    let result_state = if request.result.get("status").and_then(Value::as_str) == Some("completed")
+    {
+        "completed"
+    } else {
+        "failed"
+    };
+    conn.execute(
+        "UPDATE fleet_jobs SET state=?1, result_json=?2, completed_at=?3
+         WHERE job_id=?4 AND target_node_id=?5 AND lease_id=?6 AND state='leased'",
+        params![
+            result_state,
+            request.result.to_string(),
+            Utc::now().to_rfc3339(),
+            request.job_id,
+            request.node_id,
+            request.lease_id
+        ],
+    )?;
+    json_response(
+        200,
+        &json!({"jobId": request.job_id, "state": result_state}),
+    )
+}
+
+pub fn run_local_fleet_job(home: &Path, body: Option<&str>) -> Result<ApiResponse> {
+    let mut spec: crate::executor_node::ExecutorJob = match parse(body) {
+        Ok(value) => value,
+        Err(response) => return Ok(response),
+    };
+    let conn = open(home)?;
+    let node = load_or_create_local_node(&conn)?;
+    if !role_has_executor(&node.role)
+        || !node.executor_shared
+        || node.lifecycle != LIFECYCLE_RUNNING
+    {
+        return api_error(
+            409,
+            "executor_unavailable",
+            "This executor is not running and shared.",
+            None,
+        );
+    }
+    if spec.command == ["coven:fleet-system-info"] {
+        spec.command = if cfg!(windows) {
+            vec![
+                "cmd.exe".into(),
+                "/D".into(),
+                "/S".into(),
+                "/C".into(),
+                "ver & echo Computer: %COMPUTERNAME% & echo User: %USERNAME%".into(),
+            ]
+        } else {
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "uname -a; hostname; whoami".into(),
+            ]
+        };
+    }
+    let result = crate::executor_node::run_job(&spec);
+    json_response(200, &serde_json::to_value(result)?)
+}
+
 fn parse<T: for<'de> Deserialize<'de>>(body: Option<&str>) -> std::result::Result<T, ApiResponse> {
     let payload = parse_body(body).map_err(|e| {
         api_error(400, "invalid_request", &e.to_string(), None).expect("serialize API error")
@@ -1133,6 +1389,86 @@ mod tests {
         })
         .to_string();
         assert_eq!(reconnect(hub.path(), Some(&reconnect_request))?.status, 200);
+        Ok(())
+    }
+
+    #[test]
+    fn trusted_executor_claims_and_completes_one_pulled_job() -> Result<()> {
+        let hub = tempfile::tempdir()?;
+        let executor = tempfile::tempdir()?;
+        let enrollment = body(create_enrollment(hub.path(), Some("{}"))?);
+        let enrolled = body(enroll(
+            hub.path(),
+            Some(
+                &json!({
+                    "nodeId": "node_windows",
+                    "enrollmentCredential": enrollment["credential"],
+                    "protocolVersion": PROTOCOL
+                })
+                .to_string(),
+            ),
+        )?);
+        let credential = enrolled["nodeCredential"].as_str().unwrap();
+        let queued = body(queue_system_info_job(
+            hub.path(),
+            Some(r#"{"targetNodeId":"node_windows"}"#),
+        )?);
+        let job_id = queued["jobId"].as_str().unwrap();
+
+        let challenge = body(create_challenge(
+            hub.path(),
+            Some(r#"{"nodeId":"node_windows"}"#),
+        )?);
+        let nonce = challenge["nonce"].as_str().unwrap();
+        let claimed = body(claim_fleet_job(
+            hub.path(),
+            Some(
+                &json!({
+                    "nodeId": "node_windows",
+                    "nonce": nonce,
+                    "proof": proof(credential, nonce)
+                })
+                .to_string(),
+            ),
+        )?);
+        assert_eq!(claimed["job"]["jobId"], job_id);
+        let lease_id = claimed["leaseId"].as_str().unwrap();
+
+        configure_local_role(
+            executor.path(),
+            Some(r#"{"role":"executor","capabilities":["shell"]}"#),
+        )?;
+        configure_local_sharing(executor.path(), Some(r#"{"enabled":true}"#))?;
+        local_lifecycle(executor.path(), "start", None)?;
+        let result = body(run_local_fleet_job(
+            executor.path(),
+            Some(&claimed["job"].to_string()),
+        )?);
+        assert_eq!(result["status"], "completed");
+
+        let challenge = body(create_challenge(
+            hub.path(),
+            Some(r#"{"nodeId":"node_windows"}"#),
+        )?);
+        let nonce = challenge["nonce"].as_str().unwrap();
+        let completed = body(complete_fleet_job(
+            hub.path(),
+            Some(
+                &json!({
+                    "nodeId": "node_windows",
+                    "nonce": nonce,
+                    "proof": proof(credential, nonce),
+                    "jobId": job_id,
+                    "leaseId": lease_id,
+                    "result": result
+                })
+                .to_string(),
+            ),
+        )?);
+        assert_eq!(completed["state"], "completed");
+        let jobs = body(list_fleet_jobs(hub.path())?);
+        assert_eq!(jobs["jobs"][0]["state"], "completed");
+        assert_eq!(jobs["jobs"][0]["result"]["jobId"], job_id);
         Ok(())
     }
 

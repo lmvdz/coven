@@ -55,6 +55,11 @@ authorization.
 | POST | `/api/v1/fleet/local-credentials/:hubId/proof` | Derive a reconnect proof without returning the credential. |
 | POST | `/api/v1/fleet/challenges` | Create a 60-second, single-use challenge for a trusted node. |
 | POST | `/api/v1/fleet/reconnect` | Authenticate a node id, nonce, and derived proof. |
+| POST | `/api/v1/fleet/jobs/claim` | Authenticated executor claim of one queued job addressed to its node id. |
+| POST | `/api/v1/fleet/jobs/complete` | Authenticated, lease-bound executor result delivery. |
+| POST | `/api/v1/fleet/local-jobs/system-info` | Queue a bounded system-information job for an approved node. |
+| GET | `/api/v1/fleet/local-jobs` | List recent durable Fleet jobs and normalized results. |
+| POST | `/api/v1/fleet/local-jobs/run` | Execute one claimed Fleet job through the local executor policy. |
 | GET | `/api/v1/fleet/trusted-nodes` | List trust lifecycle metadata; never credential hashes. |
 | POST | `/api/v1/fleet/trusted-nodes/:id/revoke` | Idempotently revoke durable trust. |
 

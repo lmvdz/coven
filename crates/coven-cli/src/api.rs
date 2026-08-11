@@ -837,6 +837,13 @@ pub(crate) fn handle_request_with_runtime_and_authority(
         }
         ("POST", "/fleet/challenges") => crate::fleet::create_challenge(coven_home, body),
         ("POST", "/fleet/reconnect") => crate::fleet::reconnect(coven_home, body),
+        ("POST", "/fleet/jobs/claim") => crate::fleet::claim_fleet_job(coven_home, body),
+        ("POST", "/fleet/jobs/complete") => crate::fleet::complete_fleet_job(coven_home, body),
+        ("POST", "/fleet/local-jobs/system-info") => {
+            crate::fleet::queue_system_info_job(coven_home, body)
+        }
+        ("GET", "/fleet/local-jobs") => crate::fleet::list_fleet_jobs(coven_home),
+        ("POST", "/fleet/local-jobs/run") => crate::fleet::run_local_fleet_job(coven_home, body),
         ("GET", "/fleet/trusted-nodes") => crate::fleet::list_trusted_nodes(coven_home),
         ("POST", path)
             if path.starts_with("/fleet/trusted-nodes/") && path.ends_with("/revoke") =>

@@ -3349,6 +3349,8 @@ fn fleet_remote_route_allowed(method: &str, path: &str) -> bool {
                 || path == "/api/v1/fleet/pairing-requests"
                 || path == "/api/v1/fleet/challenges"
                 || path == "/api/v1/fleet/reconnect"
+                || path == "/api/v1/fleet/jobs/claim"
+                || path == "/api/v1/fleet/jobs/complete"
                 || (path.starts_with("/api/v1/fleet/pairing-requests/")
                     && path.ends_with("/claim"))))
 }
@@ -6350,12 +6352,16 @@ mod tests {
             ("POST", "/api/v1/fleet/pairing-requests/request-1/claim"),
             ("POST", "/api/v1/fleet/challenges"),
             ("POST", "/api/v1/fleet/reconnect"),
+            ("POST", "/api/v1/fleet/jobs/claim"),
+            ("POST", "/api/v1/fleet/jobs/complete"),
         ] {
             assert!(fleet_remote_route_allowed(method, path), "{method} {path}");
         }
         for (method, path) in [
             ("GET", "/api/v1/health"),
             ("GET", "/api/v1/fleet/trusted-nodes"),
+            ("GET", "/api/v1/fleet/local-jobs"),
+            ("POST", "/api/v1/fleet/local-jobs/run"),
             ("POST", "/api/v1/fleet/enrollment-credentials"),
             ("POST", "/api/v1/fleet/pairing-requests/request-1/approve"),
             ("POST", "/api/v1/fleet/trusted-nodes/node-1/revoke"),
