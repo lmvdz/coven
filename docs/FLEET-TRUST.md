@@ -103,3 +103,23 @@ Executor sharing is off by default and can be enabled only for `executor` or
 it advertises available only while the fleet service is running, sharing is
 enabled, and the local role includes executor. Draining immediately rejects new
 dispatch while an already-running stateless job is allowed to finish.
+
+## Desktop transport
+
+Cave starts the local daemon with `COVEN_DAEMON_TCP=127.0.0.1:8787` and an
+explicit `COVEN_DAEMON_ALLOW_HOST` containing only the machine's current
+Tailscale IPv4 address. The background-daemon launcher carries those settings
+into the hidden `daemon serve` process on macOS, Linux, and Windows. The daemon
+still binds only to loopback; Cave publishes that one socket through a
+tailnet-private Tailscale TCP Serve route.
+
+Port 8787 is a restricted Fleet listener. It accepts only the minimal discovery,
+enrollment redemption, pairing request/claim, challenge, and reconnect routes.
+Local administration, health, memory, sessions, trust listing, approval,
+revocation, and all other daemon APIs return `403` on that listener. The normal
+Unix socket or Windows named pipe remains the local administration transport.
+
+Cave inspects `tailscale serve status --json` before changing Serve state. It
+claims port 8787 only when unused, treats the exact `127.0.0.1:8787` forward as
+its own idempotent route, refuses to overwrite any other route, and removes only
+that exact owned forward when Fleet stops.

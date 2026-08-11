@@ -1,6 +1,6 @@
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::io::Write;
-#[cfg(unix)]
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -1345,9 +1345,39 @@ pub(crate) fn ensure_private_coven_home(coven_home: &Path) -> Result<()> {
 }
 
 pub fn background_server_spec(current_exe: &Path, coven_home: &Path) -> DaemonSpawnSpec {
+    background_server_spec_with_transport(
+        current_exe,
+        coven_home,
+        std::env::var_os("COVEN_DAEMON_TCP").as_deref(),
+        std::env::var_os("COVEN_DAEMON_ALLOW_HOST").as_deref(),
+    )
+}
+
+fn background_server_spec_with_transport(
+    current_exe: &Path,
+    coven_home: &Path,
+    tcp: Option<&OsStr>,
+    allowed_hosts: Option<&OsStr>,
+) -> DaemonSpawnSpec {
+    let mut args = vec!["daemon".to_string(), "serve".to_string()];
+    if let Some(tcp) = tcp.filter(|value| !value.is_empty()) {
+        args.push("--tcp".to_string());
+        args.push(tcp.to_string_lossy().into_owned());
+    }
+    if let Some(hosts) = allowed_hosts.filter(|value| !value.is_empty()) {
+        for host in hosts
+            .to_string_lossy()
+            .split(',')
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+        {
+            args.push("--allow-host".to_string());
+            args.push(host.to_string());
+        }
+    }
     DaemonSpawnSpec {
         program: current_exe.to_path_buf(),
-        args: vec!["daemon".to_string(), "serve".to_string()],
+        args,
         coven_home: coven_home.to_path_buf(),
     }
 }
@@ -2306,9 +2336,7 @@ fn daemon_status_from_health_socket(socket: &str) -> Result<Option<DaemonStatus>
 // Unix socket — a misbehaving network client can otherwise hold the API
 // thread indefinitely (slowloris) or force a huge allocation by claiming a
 // large body.
-#[cfg(unix)]
 pub const TCP_IO_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(unix)]
 pub const MAX_TCP_BODY_BYTES: usize = 1024 * 1024;
 
 /// Body cap for Unix socket and Windows named pipe transports.
@@ -2323,7 +2351,6 @@ pub const MAX_SOCKET_BODY_BYTES: usize = 4 * 1024 * 1024;
 #[cfg_attr(windows, allow(dead_code))]
 pub const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(60);
 
-#[cfg(unix)]
 fn ensure_loopback_addrs(addrs: &[SocketAddr]) -> Result<()> {
     if addrs.is_empty() {
         anyhow::bail!("TCP listener address did not resolve to any sockets");
@@ -2346,7 +2373,6 @@ fn ensure_loopback_addrs(addrs: &[SocketAddr]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 pub fn bind_tcp_listener<A: ToSocketAddrs>(addr: A) -> Result<TcpListener> {
     let addrs: Vec<SocketAddr> = addr
         .to_socket_addrs()
@@ -2383,8 +2409,6 @@ fn is_client_disconnect(error: &anyhow::Error) -> bool {
     })
 }
 
-#[cfg(unix)]
-#[cfg(test)]
 pub fn serve_next_tcp_connection(
     listener: &TcpListener,
     coven_home: &Path,
@@ -2398,7 +2422,6 @@ pub fn serve_next_tcp_connection(
     serve_accepted_tcp_connection(stream, coven_home, status, runtime, allowed_hosts)
 }
 
-#[cfg(unix)]
 fn serve_accepted_tcp_connection(
     stream: TcpStream,
     coven_home: &Path,
@@ -2418,6 +2441,13 @@ fn serve_accepted_tcp_connection(
     stream
         .set_write_timeout(Some(TCP_IO_TIMEOUT))
         .context("failed to set TCP write timeout")?;
+    // The accepted socket's local address is the listener's, so the Fleet
+    // listener stays identifiable after upstream split accept from serve.
+    let fleet_remote_only = stream
+        .local_addr()
+        .context("failed to read accepted TCP local address")?
+        .port()
+        == 8787;
     let read = stream.try_clone().context("failed to clone TCP stream")?;
     handle_http_stream(
         read,
@@ -2426,7 +2456,10 @@ fn serve_accepted_tcp_connection(
         status,
         runtime,
         Some(MAX_TCP_BODY_BYTES),
-        HostGuard::Loopback { allowed_hosts },
+        HostGuard::Loopback {
+            allowed_hosts,
+            fleet_remote_only,
+        },
     )
 }
 
@@ -3303,7 +3336,21 @@ fn cancel_active_tcp_connection(active: &Mutex<Option<TcpStream>>) {
 #[derive(Clone, Copy)]
 enum HostGuard<'a> {
     Disabled,
-    Loopback { allowed_hosts: &'a [String] },
+    Loopback {
+        allowed_hosts: &'a [String],
+        fleet_remote_only: bool,
+    },
+}
+
+fn fleet_remote_route_allowed(method: &str, path: &str) -> bool {
+    (method == "GET" && path == "/api/v1/discovery/advertisement")
+        || (method == "POST"
+            && (path == "/api/v1/fleet/enroll"
+                || path == "/api/v1/fleet/pairing-requests"
+                || path == "/api/v1/fleet/challenges"
+                || path == "/api/v1/fleet/reconnect"
+                || (path.starts_with("/api/v1/fleet/pairing-requests/")
+                    && path.ends_with("/claim"))))
 }
 
 fn handle_http_stream<R, W>(
@@ -3322,6 +3369,7 @@ where
     let mut reader = BufReader::new(read);
     let request_line = read_http_request_line(&mut reader)?;
     let headers = read_http_headers(&mut reader)?;
+    let (method, path) = parse_request_line(&request_line)?;
     // On the TCP transport (loopback-only), defend against browser-driven CSRF
     // and DNS-rebinding: a real CLI/proxy client never sends a cross-origin
     // Origin, and a rebinding attack arrives with a non-loopback Host. The Unix
@@ -3332,7 +3380,11 @@ where
     // forwards a fixed tailnet FQDN it cannot rewrite — can reach the API. The
     // bind stays loopback and the API stays unauthenticated; the operator is
     // asserting an authenticated transport (Tailscale/SSH) fronts that host.
-    if let HostGuard::Loopback { allowed_hosts } = guard {
+    if let HostGuard::Loopback {
+        allowed_hosts,
+        fleet_remote_only,
+    } = guard
+    {
         let host = headers.host.as_deref();
         if !host_is_loopback(host) && !host_in_allowlist(host, allowed_hosts) {
             return write_forbidden(
@@ -3345,6 +3397,12 @@ where
                 return write_forbidden(&mut write, "Cross-origin requests are not allowed.");
             }
         }
+        if fleet_remote_only && !fleet_remote_route_allowed(method, path) {
+            return write_forbidden(
+                &mut write,
+                "This Fleet listener exposes only remote pairing and discovery routes.",
+            );
+        }
     }
     if let Some(max) = max_body_bytes {
         if headers.content_length > max {
@@ -3352,7 +3410,6 @@ where
         }
     }
     let body = read_http_body(&mut reader, headers.content_length)?;
-    let (method, path) = parse_request_line(&request_line)?;
     let local_control = if matches!(guard, HostGuard::Disabled) {
         crate::mobile_memory::gateway::handle_local_control(method, path, body.as_deref())
     } else {
@@ -3793,11 +3850,9 @@ fn serve_forever_with_lifetime_job_installer(
         Arc,
     };
 
-    let _ = tcp_addr; // TCP not wired on Windows in this prototype
-    let _ = allowed_hosts; // only meaningful on the (Unix) TCP transport
-
     let _serve_lock = acquire_serve_lock(coven_home)?;
     install_lifetime_job()?;
+
     let status = DaemonStatus {
         pid: std::process::id(),
         started_at: started_at.clone(),
@@ -3828,6 +3883,31 @@ fn serve_forever_with_lifetime_job_installer(
     )?);
     start_threads_proposal_scheduler(coven_home)?;
     start_store_maintenance_scheduler(coven_home)?;
+
+    if let Some(addr) = tcp_addr {
+        let tcp_listener = bind_tcp_listener(addr)?;
+        let tcp_home = coven_home.to_path_buf();
+        let tcp_status = status.clone();
+        let tcp_runtime = Arc::clone(&runtime);
+        let tcp_allowed_hosts = allowed_hosts.to_vec();
+        std::thread::Builder::new()
+            .name("coven-tcp-api".into())
+            .spawn(move || loop {
+                if let Err(error) = serve_next_tcp_connection(
+                    &tcp_listener,
+                    &tcp_home,
+                    Some(tcp_status.clone()),
+                    tcp_runtime.as_ref(),
+                    &tcp_allowed_hosts,
+                ) {
+                    if !is_client_disconnect(&error) {
+                        eprintln!("coven daemon: TCP connection error: {error:#}");
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            })
+            .context("failed to start Coven TCP listener thread")?;
+    }
 
     const MAX_INFLIGHT: usize = 64;
     let inflight = Arc::new(AtomicUsize::new(0));
@@ -5948,7 +6028,10 @@ mod tests {
             None,
             &NoopSessionRuntime,
             Some(MAX_TCP_BODY_BYTES),
-            HostGuard::Loopback { allowed_hosts: &[] },
+            HostGuard::Loopback {
+                allowed_hosts: &[],
+                fleet_remote_only: false,
+            },
         )
         .expect("handle ok");
         let response = String::from_utf8(output).expect("utf8");
@@ -5975,7 +6058,10 @@ mod tests {
             None,
             &NoopSessionRuntime,
             Some(MAX_TCP_BODY_BYTES),
-            HostGuard::Loopback { allowed_hosts: &[] },
+            HostGuard::Loopback {
+                allowed_hosts: &[],
+                fleet_remote_only: false,
+            },
         )
         .expect("handle ok");
         let response = String::from_utf8(output).expect("utf8");
@@ -6007,6 +6093,7 @@ mod tests {
             Some(MAX_TCP_BODY_BYTES),
             HostGuard::Loopback {
                 allowed_hosts: &allowed,
+                fleet_remote_only: false,
             },
         )
         .expect("handle ok");
@@ -6035,6 +6122,7 @@ mod tests {
             Some(MAX_TCP_BODY_BYTES),
             HostGuard::Loopback {
                 allowed_hosts: &allowed,
+                fleet_remote_only: false,
             },
         )
         .expect("handle ok");
@@ -6107,7 +6195,10 @@ mod tests {
             None,
             &NoopSessionRuntime,
             Some(MAX_TCP_BODY_BYTES),
-            HostGuard::Loopback { allowed_hosts: &[] },
+            HostGuard::Loopback {
+                allowed_hosts: &[],
+                fleet_remote_only: false,
+            },
         )
         .expect("handle ok");
         let response = String::from_utf8(output).expect("utf8");
@@ -6138,7 +6229,6 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
     }
 
-    #[cfg(unix)]
     #[test]
     fn tcp_health_does_not_advertise_owner_only_session_launch_policy() {
         use crate::api::NoopSessionRuntime;
@@ -6251,7 +6341,30 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[test]
+    fn fleet_remote_listener_exposes_only_minimal_trust_routes() {
+        for (method, path) in [
+            ("GET", "/api/v1/discovery/advertisement"),
+            ("POST", "/api/v1/fleet/enroll"),
+            ("POST", "/api/v1/fleet/pairing-requests"),
+            ("POST", "/api/v1/fleet/pairing-requests/request-1/claim"),
+            ("POST", "/api/v1/fleet/challenges"),
+            ("POST", "/api/v1/fleet/reconnect"),
+        ] {
+            assert!(fleet_remote_route_allowed(method, path), "{method} {path}");
+        }
+        for (method, path) in [
+            ("GET", "/api/v1/health"),
+            ("GET", "/api/v1/fleet/trusted-nodes"),
+            ("POST", "/api/v1/fleet/enrollment-credentials"),
+            ("POST", "/api/v1/fleet/pairing-requests/request-1/approve"),
+            ("POST", "/api/v1/fleet/trusted-nodes/node-1/revoke"),
+            ("GET", "/api/v1/memory/overview"),
+        ] {
+            assert!(!fleet_remote_route_allowed(method, path), "{method} {path}");
+        }
+    }
+
     #[test]
     fn bind_tcp_listener_serves_memory_overview_over_tcp() -> Result<()> {
         use crate::api::NoopSessionRuntime;
@@ -6287,7 +6400,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
     #[test]
     fn bind_tcp_listener_rejects_non_loopback() {
         let error = bind_tcp_listener("0.0.0.0:0").expect_err("should reject wildcard bind");
@@ -7014,14 +7126,40 @@ mod tests {
 
     #[test]
     fn builds_background_server_spawn_spec() {
-        let spec = background_server_spec(
+        let spec = background_server_spec_with_transport(
             Path::new("/usr/local/bin/coven"),
             Path::new("/tmp/coven-home"),
+            None,
+            None,
         );
 
         assert_eq!(spec.program, PathBuf::from("/usr/local/bin/coven"));
         assert_eq!(spec.args, vec!["daemon".to_string(), "serve".to_string()]);
         assert_eq!(spec.coven_home, PathBuf::from("/tmp/coven-home"));
+    }
+
+    #[test]
+    fn background_server_spawn_spec_carries_private_fleet_transport() {
+        let spec = background_server_spec_with_transport(
+            Path::new("C:/Coven/coven.exe"),
+            Path::new("C:/Coven/home"),
+            Some(OsStr::new("127.0.0.1:8787")),
+            Some(OsStr::new("100.74.6.10, windows.tailnet.ts.net")),
+        );
+
+        assert_eq!(
+            spec.args,
+            vec![
+                "daemon",
+                "serve",
+                "--tcp",
+                "127.0.0.1:8787",
+                "--allow-host",
+                "100.74.6.10",
+                "--allow-host",
+                "windows.tailnet.ts.net",
+            ]
+        );
     }
 
     #[cfg(windows)]
