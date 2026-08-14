@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 use std::env;
+#[cfg(any(windows, test))]
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -2324,9 +2326,38 @@ fn continuity_args(
 }
 
 fn executable_exists(executable: &str) -> bool {
-    env::var_os("PATH")
-        .map(|paths| executable_exists_in_paths(executable, env::split_paths(&paths)))
-        .unwrap_or(false)
+    executable_exists_in_paths(executable, harness_search_paths())
+}
+
+fn harness_search_paths() -> Vec<PathBuf> {
+    let paths = env::var_os("PATH")
+        .map(|value| env::split_paths(&value).collect::<Vec<_>>())
+        .unwrap_or_default();
+    #[cfg(windows)]
+    {
+        let mut paths = paths;
+        // Desktop/startup processes often inherit Windows' system PATH rather
+        // than the interactive shell PATH. npm's per-user global shims live
+        // here by default, so discover them without requiring Cave, Git Bash,
+        // or a login script to mutate the daemon's process environment.
+        append_windows_npm_search_path(&mut paths, env::var_os("APPDATA"));
+        paths
+    }
+    #[cfg(not(windows))]
+    {
+        paths
+    }
+}
+
+#[cfg(any(windows, test))]
+fn append_windows_npm_search_path(paths: &mut Vec<PathBuf>, app_data: Option<OsString>) {
+    let Some(app_data) = app_data.filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let npm = PathBuf::from(app_data).join("npm");
+    if !paths.iter().any(|candidate| candidate == &npm) {
+        paths.push(npm);
+    }
 }
 
 /// Availability check for a harness: most harnesses rely on PATH only, but
@@ -2357,16 +2388,13 @@ pub(crate) fn spawn_executable_for_platform(executable: &str) -> String {
             return r.path.to_string_lossy().into_owned();
         }
     }
-    env::var_os("PATH")
-        .and_then(|paths| {
-            resolve_executable_in_paths_for_windows(
-                executable,
-                env::split_paths(&paths),
-                pathext_extensions(),
-            )
-        })
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| executable.to_string())
+    resolve_executable_in_paths_for_windows(
+        executable,
+        harness_search_paths(),
+        pathext_extensions(),
+    )
+    .map(|path| path.to_string_lossy().into_owned())
+    .unwrap_or_else(|| executable.to_string())
 }
 
 #[cfg(not(windows))]
@@ -2622,6 +2650,25 @@ mod tests {
 
         assert_eq!(resolved, temp_dir.path().join("codex.cmd"));
         Ok(())
+    }
+
+    #[test]
+    fn windows_harness_search_adds_the_per_user_npm_shim_directory() {
+        let mut paths = vec![PathBuf::from(r"C:\Windows\System32")];
+        append_windows_npm_search_path(
+            &mut paths,
+            Some(OsString::from(r"C:\Users\Lars\AppData\Roaming")),
+        );
+        assert_eq!(
+            paths.last(),
+            Some(&PathBuf::from(r"C:\Users\Lars\AppData\Roaming").join("npm"))
+        );
+
+        append_windows_npm_search_path(
+            &mut paths,
+            Some(OsString::from(r"C:\Users\Lars\AppData\Roaming")),
+        );
+        assert_eq!(paths.len(), 2, "the fallback directory is not duplicated");
     }
 
     #[test]
