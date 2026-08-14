@@ -5,9 +5,17 @@
 //! unauthorized until this module enrolls it. Secrets are represented only by
 //! hashes in the hub store and are returned exactly once to the enrolling node.
 
-use std::path::Path;
+use std::{
+    fs,
+    path::Path,
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc,
+    },
+};
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
@@ -22,6 +30,12 @@ const MAX_ENROLLMENT_TTL_SECONDS: i64 = 600;
 const DEFAULT_ENROLLMENT_TTL_SECONDS: i64 = 300;
 const CHALLENGE_TTL_SECONDS: i64 = 60;
 const JOB_LEASE_TTL_SECONDS: i64 = 60;
+const MAX_REMOTE_TURN_PROMPT_BYTES: usize = 256 * 1024;
+const MAX_REMOTE_TURN_CONTEXT_MESSAGES: usize = 256;
+const MAX_REMOTE_TURN_CONTEXT_BYTES: usize = 1024 * 1024;
+const MAX_REMOTE_TURN_ATTACHMENTS: usize = 8;
+const MAX_REMOTE_TURN_ATTACHMENT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_REMOTE_TURN_FIELD_BYTES: usize = 4096;
 
 fn store_path(home: &Path) -> std::path::PathBuf {
     home.join("coven.sqlite3")
@@ -71,9 +85,28 @@ fn open(home: &Path) -> Result<Connection> {
             lease_id TEXT, result_json TEXT,
             created_at TEXT NOT NULL, leased_at TEXT, lease_expires_at TEXT,
             completed_at TEXT
+         );
+         CREATE TABLE IF NOT EXISTS fleet_execution_receipts (
+            job_id TEXT PRIMARY KEY NOT NULL, spec_hash TEXT NOT NULL,
+            state TEXT NOT NULL, result_json TEXT,
+            started_at TEXT NOT NULL, completed_at TEXT
+         );
+         CREATE TABLE IF NOT EXISTS fleet_job_events (
+            job_id TEXT NOT NULL, sequence INTEGER NOT NULL,
+            chunk_base64 TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY (job_id, sequence)
          );",
     )
     .context("failed to initialize fleet trust schema")?;
+    // Additive migration for executors enrolled before capability heartbeats.
+    let _ = conn.execute(
+        "ALTER TABLE fleet_trusted_nodes ADD COLUMN capabilities_json TEXT NOT NULL DEFAULT '[]'",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE fleet_trusted_nodes ADD COLUMN display_name TEXT",
+        [],
+    );
     Ok(conn)
 }
 
@@ -987,8 +1020,8 @@ pub fn revoke(home: &Path, node_id: &str) -> Result<ApiResponse> {
 
 pub fn list_trusted_nodes(home: &Path) -> Result<ApiResponse> {
     let conn = open(home)?;
-    let mut statement = conn.prepare("SELECT node_id, enrolled_at, last_seen_at, revoked_at FROM fleet_trusted_nodes ORDER BY enrolled_at")?;
-    let nodes = statement.query_map([], |r| Ok(json!({"nodeId": r.get::<_, String>(0)?, "enrolledAt": r.get::<_, String>(1)?, "lastSeenAt": r.get::<_, String>(2)?, "revokedAt": r.get::<_, Option<String>>(3)?})))?.collect::<rusqlite::Result<Vec<Value>>>()?;
+    let mut statement = conn.prepare("SELECT node_id, enrolled_at, last_seen_at, revoked_at, display_name, capabilities_json FROM fleet_trusted_nodes ORDER BY enrolled_at")?;
+    let nodes = statement.query_map([], |r| Ok(json!({"nodeId": r.get::<_, String>(0)?, "enrolledAt": r.get::<_, String>(1)?, "lastSeenAt": r.get::<_, String>(2)?, "revokedAt": r.get::<_, Option<String>>(3)?, "displayName": r.get::<_, Option<String>>(4)?, "capabilities": serde_json::from_str::<Vec<String>>(&r.get::<_, String>(5)?).unwrap_or_default()})))?.collect::<rusqlite::Result<Vec<Value>>>()?;
     json_response(200, &json!({ "nodes": nodes }))
 }
 
@@ -996,6 +1029,287 @@ pub fn list_trusted_nodes(home: &Path) -> Result<ApiResponse> {
 #[serde(rename_all = "camelCase")]
 struct QueueFleetJob {
     target_node_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueRemoteTurn {
+    turn_id: String,
+    target_node_id: String,
+    familiar_id: String,
+    harness: String,
+    #[serde(default)]
+    model: Option<String>,
+    workspace: RemoteTurnWorkspace,
+    prompt: String,
+    #[serde(default)]
+    context_messages: Vec<RemoteTurnMessage>,
+    #[serde(default)]
+    attachments: Vec<RemoteTurnAttachment>,
+    permission_mode: String,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteTurnWorkspace {
+    root: String,
+    #[serde(default)]
+    project_name: Option<String>,
+    #[serde(default)]
+    repository_url: Option<String>,
+    #[serde(default)]
+    checkpoint: Option<String>,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteTurnMessage {
+    role: String,
+    text: String,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteTurnAttachment {
+    name: String,
+    mime_type: String,
+    data_base64: String,
+}
+
+fn bounded_remote_field(value: &str) -> bool {
+    !value.trim().is_empty() && value.len() <= MAX_REMOTE_TURN_FIELD_BYTES
+}
+
+fn valid_remote_identifier(value: &str) -> bool {
+    bounded_remote_field(value)
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/' | b':')
+        })
+}
+
+fn valid_remote_token(value: &str) -> bool {
+    bounded_remote_field(value)
+        && !value.contains("..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn validate_remote_turn(request: &QueueRemoteTurn) -> std::result::Result<(), &'static str> {
+    if !valid_remote_token(&request.turn_id)
+        || !valid_remote_token(&request.target_node_id)
+        || !valid_remote_token(&request.familiar_id)
+        || !valid_remote_token(&request.harness)
+        || request
+            .model
+            .as_deref()
+            .is_some_and(|value| !valid_remote_identifier(value))
+    {
+        return Err("remote turn identifiers are invalid");
+    }
+    if request.prompt.trim().is_empty() || request.prompt.len() > MAX_REMOTE_TURN_PROMPT_BYTES {
+        return Err("remote turn prompt is empty or too large");
+    }
+    if !bounded_remote_field(&request.workspace.root)
+        || request
+            .workspace
+            .project_name
+            .as_deref()
+            .is_some_and(|value| !bounded_remote_field(value))
+        || request
+            .workspace
+            .repository_url
+            .as_deref()
+            .is_some_and(|value| !bounded_remote_field(value))
+        || request
+            .workspace
+            .checkpoint
+            .as_deref()
+            .is_some_and(|value| !valid_remote_token(value))
+    {
+        return Err("remote turn workspace is invalid");
+    }
+    if !matches!(request.permission_mode.as_str(), "read" | "full") {
+        return Err("remote turn permission mode is invalid");
+    }
+    if request.context_messages.len() > MAX_REMOTE_TURN_CONTEXT_MESSAGES
+        || request.attachments.len() > MAX_REMOTE_TURN_ATTACHMENTS
+        || request
+            .timeout_seconds
+            .is_some_and(|seconds| !(1..=3600).contains(&seconds))
+    {
+        return Err("remote turn bounds were exceeded");
+    }
+    if request.context_messages.iter().any(|message| {
+        !matches!(message.role.as_str(), "user" | "assistant" | "system")
+            || message.text.len() > MAX_REMOTE_TURN_PROMPT_BYTES
+    }) {
+        return Err("remote turn context is invalid");
+    }
+    if request
+        .context_messages
+        .iter()
+        .map(|message| message.text.len())
+        .sum::<usize>()
+        > MAX_REMOTE_TURN_CONTEXT_BYTES
+    {
+        return Err("remote turn context is too large");
+    }
+    if request.attachments.iter().any(|attachment| {
+        !bounded_remote_field(&attachment.name)
+            || !bounded_remote_field(&attachment.mime_type)
+            || attachment.data_base64.len() > MAX_REMOTE_TURN_ATTACHMENT_BYTES * 2
+    }) {
+        return Err("remote turn attachment is invalid");
+    }
+    Ok(())
+}
+
+pub fn queue_remote_turn_job(home: &Path, body: Option<&str>) -> Result<ApiResponse> {
+    let request: QueueRemoteTurn = match parse(body) {
+        Ok(value) => value,
+        Err(response) => return Ok(response),
+    };
+    if let Err(message) = validate_remote_turn(&request) {
+        return api_error(400, "invalid_remote_turn", message, None);
+    }
+    let conn = open(home)?;
+    let trusted: Option<(String, String)> = conn.query_row(
+        "SELECT last_seen_at, capabilities_json FROM fleet_trusted_nodes WHERE node_id=?1 AND revoked_at IS NULL",
+        [&request.target_node_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?;
+    let Some((last_seen_at, capabilities_json)) = trusted else {
+        return api_error(
+            404,
+            "node_untrusted",
+            "Choose an approved Fleet device.",
+            None,
+        );
+    };
+    let recently_seen = DateTime::parse_from_rfc3339(&last_seen_at)
+        .map(|seen| {
+            Utc::now().signed_duration_since(seen.with_timezone(&Utc)) <= Duration::seconds(15)
+        })
+        .unwrap_or(false);
+    if !recently_seen {
+        return api_error(
+            409,
+            "executor_offline",
+            "The selected Fleet executor is offline. Open Cave on that device and wait for it to reconnect.",
+            Some(json!({"nodeId": request.target_node_id, "lastSeenAt": last_seen_at})),
+        );
+    }
+    let capabilities: Vec<String> = serde_json::from_str(&capabilities_json).unwrap_or_default();
+    if !capabilities
+        .iter()
+        .any(|value| value == "fleet-chat-turn-v1")
+    {
+        return api_error(
+            409,
+            "executor_incompatible",
+            "Update Coven on the selected Fleet executor, then let it reconnect.",
+            Some(json!({"requiredCapability": "fleet-chat-turn-v1"})),
+        );
+    }
+    let job_id = format!("fleetturn_{}", request.turn_id);
+    let existing: Option<(String, String)> = conn
+        .query_row(
+            "SELECT target_node_id, spec_json FROM fleet_jobs WHERE job_id=?1",
+            [&job_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let context = json!({
+        "kind": "fleet-chat-turn",
+        "schemaVersion": "coven.fleet.chat-turn.v1",
+        "turnId": request.turn_id,
+        "familiarId": request.familiar_id,
+        "harness": request.harness,
+        "model": request.model,
+        "workspace": request.workspace,
+        "prompt": request.prompt,
+        "contextMessages": request.context_messages,
+        "attachments": request.attachments,
+        "permissionMode": request.permission_mode,
+        "serviceAdvertisements": []
+    });
+    let spec = json!({
+        "protocolVersion": crate::executor_node::EXECUTOR_PROTOCOL_VERSION,
+        "jobId": job_id,
+        "hubId": load_or_create_local_node(&conn)?.device_id,
+        "requiredCapabilities": ["shell", "fleet-chat-turn-v1"],
+        "command": ["coven:fleet-chat-turn"],
+        "env": {},
+        "context": context,
+        "timeoutSeconds": request.timeout_seconds.unwrap_or(900)
+    });
+    if let Some((target_node_id, prior_spec)) = existing {
+        if target_node_id != request.target_node_id || prior_spec != spec.to_string() {
+            return api_error(
+                409,
+                "remote_turn_conflict",
+                "This turn id was already dispatched with different execution details.",
+                Some(json!({"turnId": request.turn_id})),
+            );
+        }
+        let state: String = conn.query_row(
+            "SELECT state FROM fleet_jobs WHERE job_id=?1",
+            [&job_id],
+            |row| row.get(0),
+        )?;
+        return json_response(
+            200,
+            &json!({
+                "jobId": job_id, "turnId": request.turn_id,
+                "targetNodeId": request.target_node_id, "state": state,
+                "idempotent": true
+            }),
+        );
+    }
+    let created_at = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO fleet_jobs
+         (job_id, target_node_id, spec_json, state, created_at)
+         VALUES (?1, ?2, ?3, 'queued', ?4)",
+        params![job_id, request.target_node_id, spec.to_string(), created_at],
+    )?;
+    json_response(
+        201,
+        &json!({
+            "jobId": job_id, "turnId": request.turn_id,
+            "targetNodeId": request.target_node_id, "state": "queued",
+            "createdAt": created_at, "idempotent": false
+        }),
+    )
+}
+
+pub fn cancel_fleet_job(home: &Path, job_id: &str) -> Result<ApiResponse> {
+    if !valid_remote_token(job_id) {
+        return api_error(400, "invalid_fleet_job", "Fleet job id is invalid.", None);
+    }
+    let conn = open(home)?;
+    let state: Option<String> = conn
+        .query_row(
+            "SELECT state FROM fleet_jobs WHERE job_id=?1",
+            [job_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(state) = state else {
+        return api_error(404, "fleet_job_not_found", "Fleet job was not found.", None);
+    };
+    if matches!(state.as_str(), "completed" | "failed" | "cancelled") {
+        return json_response(200, &json!({"jobId": job_id, "state": state}));
+    }
+    conn.execute(
+        "UPDATE fleet_jobs SET state='cancelled', completed_at=?1
+         WHERE job_id=?2 AND state IN ('queued', 'leased')",
+        params![Utc::now().to_rfc3339(), job_id],
+    )?;
+    json_response(200, &json!({"jobId": job_id, "state": "cancelled"}))
 }
 
 pub fn queue_system_info_job(home: &Path, body: Option<&str>) -> Result<ApiResponse> {
@@ -1073,6 +1387,10 @@ struct AuthenticatedFleetRequest {
     node_id: String,
     nonce: String,
     proof: String,
+    #[serde(default)]
+    capabilities: Vec<String>,
+    #[serde(default)]
+    display_name: Option<String>,
 }
 
 fn authenticate_fleet_request(
@@ -1098,6 +1416,18 @@ pub fn claim_fleet_job(home: &Path, body: Option<&str>) -> Result<ApiResponse> {
         return Ok(response);
     }
     let mut conn = open(home)?;
+    let mut advertised = request.capabilities;
+    advertised.sort();
+    advertised.dedup();
+    advertised.retain(|value| valid_remote_identifier(value));
+    conn.execute(
+        "UPDATE fleet_trusted_nodes SET capabilities_json=?1, display_name=COALESCE(?2, display_name) WHERE node_id=?3",
+        params![
+            serde_json::to_string(&advertised)?,
+            request.display_name.as_deref().filter(|value| bounded_remote_field(value)),
+            request.node_id
+        ],
+    )?;
     let tx = conn.transaction()?;
     let queued: Option<(String, String)> = tx
         .query_row(
@@ -1116,7 +1446,13 @@ pub fn claim_fleet_job(home: &Path, body: Option<&str>) -> Result<ApiResponse> {
     let lease_id = format!("lease_{}", Uuid::new_v4().simple());
     let now = Utc::now();
     let leased_at = now.to_rfc3339();
-    let lease_expires_at = (now + Duration::seconds(JOB_LEASE_TTL_SECONDS)).to_rfc3339();
+    let requested_timeout = serde_json::from_str::<Value>(&spec_json)
+        .ok()
+        .and_then(|spec| spec.get("timeoutSeconds").and_then(Value::as_u64))
+        .unwrap_or(JOB_LEASE_TTL_SECONDS as u64)
+        .clamp(JOB_LEASE_TTL_SECONDS as u64, 3600);
+    let lease_expires_at =
+        (now + Duration::seconds(requested_timeout as i64 + JOB_LEASE_TTL_SECONDS)).to_rfc3339();
     let changed = tx.execute(
         "UPDATE fleet_jobs SET state='leased', lease_id=?1, leased_at=?2, lease_expires_at=?3
          WHERE job_id=?4 AND (state='queued' OR (state='leased' AND lease_expires_at <= ?2))",
@@ -1142,6 +1478,140 @@ struct CompleteFleetJob {
     result: Value,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FleetJobStatusRequest {
+    node_id: String,
+    nonce: String,
+    proof: String,
+    job_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AppendFleetJobEvents {
+    node_id: String,
+    nonce: String,
+    proof: String,
+    job_id: String,
+    events: Vec<FleetJobEventInput>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FleetJobEventInput {
+    sequence: i64,
+    chunk_base64: String,
+}
+
+pub fn append_authenticated_fleet_job_events(
+    home: &Path,
+    body: Option<&str>,
+) -> Result<ApiResponse> {
+    let request: AppendFleetJobEvents = match parse(body) {
+        Ok(value) => value,
+        Err(response) => return Ok(response),
+    };
+    if request.events.len() > 128
+        || request
+            .events
+            .iter()
+            .any(|event| event.sequence < 1 || event.chunk_base64.len() > 32 * 1024)
+    {
+        return api_error(
+            400,
+            "invalid_fleet_events",
+            "Fleet event batch is invalid.",
+            None,
+        );
+    }
+    let auth = AuthenticatedFleetRequest {
+        node_id: request.node_id.clone(),
+        nonce: request.nonce,
+        proof: request.proof,
+        capabilities: Vec::new(),
+        display_name: None,
+    };
+    if let Some(response) = authenticate_fleet_request(home, &auth)? {
+        return Ok(response);
+    }
+    let mut conn = open(home)?;
+    let owned: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM fleet_jobs WHERE job_id=?1 AND target_node_id=?2)",
+        params![request.job_id, request.node_id],
+        |row| row.get(0),
+    )?;
+    if !owned {
+        return api_error(404, "fleet_job_not_found", "Fleet job was not found.", None);
+    }
+    let tx = conn.transaction()?;
+    for event in &request.events {
+        tx.execute(
+            "INSERT OR IGNORE INTO fleet_job_events (job_id, sequence, chunk_base64, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                request.job_id,
+                event.sequence,
+                event.chunk_base64,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+    }
+    tx.commit()?;
+    json_response(
+        200,
+        &json!({"jobId": request.job_id, "accepted": request.events.len()}),
+    )
+}
+
+pub fn list_local_fleet_job_events(home: &Path, job_id: &str) -> Result<ApiResponse> {
+    if !valid_remote_token(job_id) {
+        return api_error(400, "invalid_fleet_job", "Fleet job id is invalid.", None);
+    }
+    let conn = open(home)?;
+    let mut statement = conn.prepare(
+        "SELECT sequence, chunk_base64 FROM fleet_job_events
+         WHERE job_id=?1 ORDER BY sequence LIMIT 4096",
+    )?;
+    let events = statement
+        .query_map([job_id], |row| {
+            Ok(json!({
+                "sequence": row.get::<_, i64>(0)?,
+                "chunkBase64": row.get::<_, String>(1)?
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    json_response(200, &json!({"jobId": job_id, "events": events}))
+}
+
+pub fn authenticated_fleet_job_status(home: &Path, body: Option<&str>) -> Result<ApiResponse> {
+    let request: FleetJobStatusRequest = match parse(body) {
+        Ok(value) => value,
+        Err(response) => return Ok(response),
+    };
+    let auth = AuthenticatedFleetRequest {
+        node_id: request.node_id.clone(),
+        nonce: request.nonce,
+        proof: request.proof,
+        capabilities: Vec::new(),
+        display_name: None,
+    };
+    if let Some(response) = authenticate_fleet_request(home, &auth)? {
+        return Ok(response);
+    }
+    let state: Option<String> = open(home)?
+        .query_row(
+            "SELECT state FROM fleet_jobs WHERE job_id=?1 AND target_node_id=?2",
+            params![request.job_id, request.node_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match state {
+        Some(state) => json_response(200, &json!({"jobId": request.job_id, "state": state})),
+        None => api_error(404, "fleet_job_not_found", "Fleet job was not found.", None),
+    }
+}
+
 pub fn complete_fleet_job(home: &Path, body: Option<&str>) -> Result<ApiResponse> {
     let request: CompleteFleetJob = match parse(body) {
         Ok(value) => value,
@@ -1151,6 +1621,8 @@ pub fn complete_fleet_job(home: &Path, body: Option<&str>) -> Result<ApiResponse
         node_id: request.node_id.clone(),
         nonce: request.nonce.clone(),
         proof: request.proof.clone(),
+        capabilities: Vec::new(),
+        display_name: None,
     };
     if let Some(response) = authenticate_fleet_request(home, &auth)? {
         return Ok(response);
@@ -1166,7 +1638,7 @@ pub fn complete_fleet_job(home: &Path, body: Option<&str>) -> Result<ApiResponse
     let Some((state, lease_id)) = current else {
         return api_error(404, "fleet_job_not_found", "Fleet job was not found.", None);
     };
-    if state == "completed" || state == "failed" {
+    if matches!(state.as_str(), "completed" | "failed" | "cancelled") {
         return json_response(200, &json!({"jobId": request.job_id, "state": state}));
     }
     if state != "leased" || lease_id.as_deref() != Some(request.lease_id.as_str()) {
@@ -1201,6 +1673,298 @@ pub fn complete_fleet_job(home: &Path, body: Option<&str>) -> Result<ApiResponse
     )
 }
 
+fn remote_turn_attachment_name(name: &str, index: usize) -> String {
+    let safe: String = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(96)
+        .collect();
+    format!(
+        "{index:02}-{}",
+        if safe.is_empty() { "attachment" } else { &safe }
+    )
+}
+
+fn remote_turn_execution_job(
+    home: &Path,
+    spec: &crate::executor_node::ExecutorJob,
+) -> std::result::Result<(crate::executor_node::ExecutorJob, std::path::PathBuf), ApiResponse> {
+    let context = spec.context.as_ref().ok_or_else(|| {
+        api_error(
+            400,
+            "remote_turn_context_required",
+            "Remote turn context is required.",
+            None,
+        )
+        .expect("serialize API error")
+    })?;
+    if context.get("schemaVersion").and_then(Value::as_str) != Some("coven.fleet.chat-turn.v1")
+        || context.get("kind").and_then(Value::as_str) != Some("fleet-chat-turn")
+    {
+        return Err(api_error(
+            400,
+            "remote_turn_protocol_mismatch",
+            "The remote turn protocol is not supported.",
+            None,
+        )
+        .expect("serialize API error"));
+    }
+    let required = |field: &str| {
+        context
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| bounded_remote_field(value))
+            .ok_or_else(|| {
+                api_error(
+                    400,
+                    "invalid_remote_turn",
+                    "Remote turn execution details are incomplete.",
+                    Some(json!({"field": field})),
+                )
+                .expect("serialize API error")
+            })
+    };
+    let turn_id = required("turnId")?;
+    let familiar_id = required("familiarId")?;
+    let harness = required("harness")?;
+    let prompt = required("prompt")?;
+    let permission = match required("permissionMode")? {
+        "read" => "read-only",
+        "full" => "full",
+        _ => {
+            return Err(api_error(
+                400,
+                "invalid_remote_turn",
+                "Remote turn permission mode is invalid.",
+                None,
+            )
+            .expect("serialize API error"))
+        }
+    };
+    let workspace_root = context
+        .get("workspace")
+        .and_then(|workspace| workspace.get("root"))
+        .and_then(Value::as_str)
+        .filter(|value| bounded_remote_field(value))
+        .ok_or_else(|| {
+            api_error(
+                400,
+                "remote_workspace_required",
+                "The remote turn needs a workspace on this executor.",
+                None,
+            )
+            .expect("serialize API error")
+        })?;
+    let workspace_path = Path::new(workspace_root);
+    if !workspace_path.is_absolute() || !workspace_path.is_dir() {
+        return Err(api_error(
+            409,
+            "remote_workspace_unavailable",
+            "The selected workspace is not available on this executor.",
+            Some(json!({"turnId": turn_id})),
+        )
+        .expect("serialize API error"));
+    }
+    if let Some(checkpoint) = context
+        .get("workspace")
+        .and_then(|workspace| workspace.get("checkpoint"))
+        .and_then(Value::as_str)
+    {
+        let current = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(workspace_path)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+        if current.as_deref() != Some(checkpoint) {
+            return Err(api_error(
+                409,
+                "remote_workspace_checkpoint_mismatch",
+                "The executor workspace is on a different revision. Update it to the hub checkpoint, then retry.",
+                Some(json!({"turnId": turn_id, "expectedCheckpoint": checkpoint})),
+            )
+            .expect("serialize API error"));
+        }
+    }
+
+    let attachments = context
+        .get("attachments")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut decoded_attachments = Vec::new();
+    let mut decoded_bytes = 0usize;
+    for (index, attachment) in attachments.iter().enumerate() {
+        let name = attachment
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("attachment");
+        let encoded = attachment
+            .get("dataBase64")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                api_error(
+                    400,
+                    "invalid_remote_attachment",
+                    "A remote turn attachment is malformed.",
+                    None,
+                )
+                .expect("serialize API error")
+            })?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| {
+                api_error(
+                    400,
+                    "invalid_remote_attachment",
+                    "A remote turn attachment is malformed.",
+                    None,
+                )
+                .expect("serialize API error")
+            })?;
+        decoded_bytes = decoded_bytes.saturating_add(bytes.len());
+        if decoded_bytes > MAX_REMOTE_TURN_ATTACHMENT_BYTES {
+            return Err(api_error(
+                413,
+                "remote_attachment_too_large",
+                "Remote turn attachments are too large.",
+                None,
+            )
+            .expect("serialize API error"));
+        }
+        decoded_attachments.push((remote_turn_attachment_name(name, index), bytes));
+    }
+
+    let model = context.get("model").and_then(Value::as_str);
+    if model.is_some_and(|value| !valid_remote_identifier(value)) {
+        return Err(api_error(
+            400,
+            "invalid_remote_turn",
+            "The remote turn model is invalid.",
+            None,
+        )
+        .expect("serialize API error"));
+    }
+
+    let attachment_root = home.join("fleet-turns").join(&spec.job_id);
+    if attachment_root.exists() {
+        fs::remove_dir_all(&attachment_root).map_err(|_| {
+            api_error(
+                500,
+                "remote_attachment_cleanup_failed",
+                "Could not prepare remote turn attachments.",
+                None,
+            )
+            .expect("serialize API error")
+        })?;
+    }
+    fs::create_dir_all(&attachment_root).map_err(|_| {
+        api_error(
+            500,
+            "remote_attachment_store_failed",
+            "Could not prepare remote turn attachments.",
+            None,
+        )
+        .expect("serialize API error")
+    })?;
+    let mut attachment_paths = Vec::new();
+    for (name, bytes) in decoded_attachments {
+        let path = attachment_root.join(name);
+        fs::write(&path, bytes).map_err(|_| {
+            api_error(
+                500,
+                "remote_attachment_store_failed",
+                "Could not prepare remote turn attachments.",
+                None,
+            )
+            .expect("serialize API error")
+        })?;
+        attachment_paths.push(path);
+    }
+
+    let mut portable_prompt = String::from(
+        "The following transcript is canonical context from the hub. Continue it; do not claim that machine-local session state is authoritative.\n\n",
+    );
+    if let Some(messages) = context.get("contextMessages").and_then(Value::as_array) {
+        for message in messages {
+            let role = message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("system");
+            let text = message
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            portable_prompt.push_str(&format!("[{role}]\n{text}\n\n"));
+        }
+    }
+    portable_prompt.push_str("[current user turn]\n");
+    portable_prompt.push_str(prompt);
+    if !attachment_paths.is_empty() {
+        portable_prompt
+            .push_str("\n\nAttachments are available on this executor at these paths:\n");
+        for path in &attachment_paths {
+            portable_prompt.push_str("- ");
+            portable_prompt.push_str(&path.to_string_lossy());
+            portable_prompt.push('\n');
+        }
+    }
+
+    let executable = std::env::current_exe().map_err(|_| {
+        api_error(
+            500,
+            "remote_executor_unavailable",
+            "Could not resolve Coven on this executor.",
+            None,
+        )
+        .expect("serialize API error")
+    })?;
+    let mut command = vec![
+        executable.to_string_lossy().to_string(),
+        "run".to_string(),
+        harness.to_string(),
+        "--stream-json".to_string(),
+        "--familiar".to_string(),
+        familiar_id.to_string(),
+        "--permission".to_string(),
+        permission.to_string(),
+    ];
+    if let Some(model) = model {
+        command.extend(["--model".to_string(), model.to_string()]);
+    }
+    command.extend(["--".to_string(), portable_prompt]);
+    let mut execution = spec.clone();
+    execution.command = command;
+    execution.cwd = Some(workspace_root.to_string());
+    let local_device_id = open(home)
+        .and_then(|conn| load_or_create_local_node(&conn))
+        .map(|node| node.device_id)
+        .map_err(|_| {
+            api_error(
+                500,
+                "fleet_store_unavailable",
+                "Fleet state is unavailable.",
+                None,
+            )
+            .expect("serialize API error")
+        })?;
+    execution.context = Some(json!({
+        "kind": "fleet-chat-turn-result",
+        "schemaVersion": "coven.fleet.chat-turn-result.v1",
+        "turnId": turn_id,
+        "executorProvenance": {"deviceId": local_device_id},
+        "serviceAdvertisements": []
+    }));
+    Ok((execution, attachment_root))
+}
+
 pub fn run_local_fleet_job(home: &Path, body: Option<&str>) -> Result<ApiResponse> {
     let mut spec: crate::executor_node::ExecutorJob = match parse(body) {
         Ok(value) => value,
@@ -1219,6 +1983,26 @@ pub fn run_local_fleet_job(home: &Path, body: Option<&str>) -> Result<ApiRespons
             None,
         );
     }
+    let declared_capabilities: Vec<String> =
+        serde_json::from_str(&node.capabilities_json).unwrap_or_default();
+    let supports = |capability: &str| {
+        matches!(capability, "shell" | "fleet-chat-turn-v1")
+            || declared_capabilities
+                .iter()
+                .any(|value| value == capability)
+    };
+    if let Some(missing) = spec
+        .required_capabilities
+        .iter()
+        .find(|capability| !supports(capability))
+    {
+        return api_error(
+            409,
+            "executor_capability_missing",
+            "This executor cannot run the requested Fleet job.",
+            Some(json!({"requiredCapability": missing})),
+        );
+    }
     if spec.command == ["coven:fleet-system-info"] {
         spec.command = if cfg!(windows) {
             vec![
@@ -1235,9 +2019,134 @@ pub fn run_local_fleet_job(home: &Path, body: Option<&str>) -> Result<ApiRespons
                 "uname -a; hostname; whoami".into(),
             ]
         };
+    } else if spec.command == ["coven:fleet-chat-turn"] {
+        if !valid_remote_token(&spec.job_id) {
+            return api_error(400, "invalid_fleet_job", "Fleet job id is invalid.", None);
+        }
+        let spec_json = serde_json::to_string(&spec)?;
+        let spec_hash = hash(&spec_json);
+        let prior: Option<(String, String, Option<String>)> = conn
+            .query_row(
+                "SELECT spec_hash, state, result_json FROM fleet_execution_receipts WHERE job_id=?1",
+                [&spec.job_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((prior_hash, state, result_json)) = prior {
+            if prior_hash != spec_hash {
+                return api_error(
+                    409,
+                    "executor_job_conflict",
+                    "This Fleet job id was already used with different execution details.",
+                    None,
+                );
+            }
+            if state == "completed" {
+                let result: Value = serde_json::from_str(result_json.as_deref().unwrap_or("{}"))?;
+                return json_response(200, &result);
+            }
+            return api_error(
+                409,
+                "executor_job_in_doubt",
+                "This Fleet turn already started on the executor. It will not be run twice.",
+                Some(json!({"jobId": spec.job_id, "state": state})),
+            );
+        }
+        conn.execute(
+            "INSERT INTO fleet_execution_receipts
+             (job_id, spec_hash, state, started_at) VALUES (?1, ?2, 'running', ?3)",
+            params![spec.job_id, spec_hash, Utc::now().to_rfc3339()],
+        )?;
+        let (execution, attachment_root) = match remote_turn_execution_job(home, &spec) {
+            Ok(value) => value,
+            Err(response) => {
+                conn.execute(
+                    "UPDATE fleet_execution_receipts SET state='rejected', completed_at=?1
+                     WHERE job_id=?2",
+                    params![Utc::now().to_rfc3339(), spec.job_id],
+                )?;
+                return Ok(response);
+            }
+        };
+        let event_sequence = Arc::new(AtomicI64::new(0));
+        let event_home = home.to_path_buf();
+        let event_job_id = spec.job_id.clone();
+        let result = crate::executor_node::run_job_observed(
+            &execution,
+            || {
+                conn.query_row(
+                    "SELECT state='cancel_requested' FROM fleet_execution_receipts WHERE job_id=?1",
+                    [&spec.job_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap_or(false)
+            },
+            move |chunk| {
+                let sequence = event_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+                let encoded = base64::engine::general_purpose::STANDARD.encode(chunk);
+                if let Ok(event_conn) = open(&event_home) {
+                    let _ = event_conn.execute(
+                        "INSERT OR IGNORE INTO fleet_job_events
+                     (job_id, sequence, chunk_base64, created_at) VALUES (?1, ?2, ?3, ?4)",
+                        params![event_job_id, sequence, encoded, Utc::now().to_rfc3339()],
+                    );
+                }
+            },
+        );
+        let _ = fs::remove_dir_all(attachment_root);
+        let result = serde_json::to_value(result)?;
+        let receipt_state = if result.get("status").and_then(Value::as_str)
+            == Some(crate::executor_node::RESULT_STATUS_CANCELLED)
+        {
+            "cancelled"
+        } else {
+            "completed"
+        };
+        conn.execute(
+            "UPDATE fleet_execution_receipts SET state=?1, result_json=?2,
+             completed_at=?3 WHERE job_id=?4 AND state IN ('running','cancel_requested')",
+            params![
+                receipt_state,
+                result.to_string(),
+                Utc::now().to_rfc3339(),
+                spec.job_id
+            ],
+        )?;
+        return json_response(200, &result);
     }
     let result = crate::executor_node::run_job(&spec);
     json_response(200, &serde_json::to_value(result)?)
+}
+
+pub fn cancel_local_fleet_execution(home: &Path, job_id: &str) -> Result<ApiResponse> {
+    if !valid_remote_token(job_id) {
+        return api_error(400, "invalid_fleet_job", "Fleet job id is invalid.", None);
+    }
+    let conn = open(home)?;
+    let changed = conn.execute(
+        "UPDATE fleet_execution_receipts SET state='cancel_requested'
+         WHERE job_id=?1 AND state='running'",
+        [job_id],
+    )?;
+    let state: Option<String> = conn
+        .query_row(
+            "SELECT state FROM fleet_execution_receipts WHERE job_id=?1",
+            [job_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match state {
+        Some(state) => json_response(
+            200,
+            &json!({"jobId": job_id, "state": state, "changed": changed == 1}),
+        ),
+        None => api_error(
+            404,
+            "fleet_execution_not_found",
+            "Fleet execution was not found.",
+            None,
+        ),
+    }
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(body: Option<&str>) -> std::result::Result<T, ApiResponse> {
@@ -1255,6 +2164,18 @@ mod tests {
 
     fn body(response: ApiResponse) -> Value {
         serde_json::from_str(&response.body).unwrap()
+    }
+
+    fn advertise_remote_turn_capability(home: &Path, node_id: &str) -> Result<()> {
+        open(home)?.execute(
+            "UPDATE fleet_trusted_nodes SET capabilities_json=?1, last_seen_at=?2 WHERE node_id=?3",
+            params![
+                r#"["shell","fleet-chat-turn-v1"]"#,
+                Utc::now().to_rfc3339(),
+                node_id
+            ],
+        )?;
+        Ok(())
     }
 
     #[test]
@@ -1473,6 +2394,256 @@ mod tests {
     }
 
     #[test]
+    fn remote_turn_dispatch_is_typed_bounded_and_idempotent() -> Result<()> {
+        let hub = tempfile::tempdir()?;
+        let enrollment = body(create_enrollment(hub.path(), Some("{}"))?);
+        body(enroll(
+            hub.path(),
+            Some(
+                &json!({
+                    "nodeId": "node_windows",
+                    "enrollmentCredential": enrollment["credential"],
+                    "protocolVersion": PROTOCOL
+                })
+                .to_string(),
+            ),
+        )?);
+        advertise_remote_turn_capability(hub.path(), "node_windows")?;
+        let request = json!({
+            "turnId": "turn_123",
+            "targetNodeId": "node_windows",
+            "familiarId": "sage",
+            "harness": "codex",
+            "model": "openai/gpt-5.6",
+            "workspace": {"root": "C:/work/project", "checkpoint": "abc123"},
+            "prompt": "Continue the existing conversation on this executor.",
+            "contextMessages": [
+                {"role": "user", "text": "Earlier question"},
+                {"role": "assistant", "text": "Earlier answer"}
+            ],
+            "attachments": [],
+            "permissionMode": "read",
+            "timeoutSeconds": 120
+        })
+        .to_string();
+        let queued = body(queue_remote_turn_job(hub.path(), Some(&request))?);
+        assert_eq!(queued["state"], "queued");
+        assert_eq!(queued["idempotent"], false);
+        assert_eq!(queued["jobId"], "fleetturn_turn_123");
+
+        let replay = body(queue_remote_turn_job(hub.path(), Some(&request))?);
+        assert_eq!(replay["jobId"], queued["jobId"]);
+        assert_eq!(replay["idempotent"], true);
+
+        let jobs = body(list_fleet_jobs(hub.path())?);
+        assert_eq!(jobs["jobs"].as_array().unwrap().len(), 1);
+        let spec_json: String = open(hub.path())?.query_row(
+            "SELECT spec_json FROM fleet_jobs WHERE job_id='fleetturn_turn_123'",
+            [],
+            |row| row.get(0),
+        )?;
+        let spec: Value = serde_json::from_str(&spec_json)?;
+        assert_eq!(spec["command"], json!(["coven:fleet-chat-turn"]));
+        assert_eq!(spec["context"]["schemaVersion"], "coven.fleet.chat-turn.v1");
+        assert_eq!(spec["context"]["workspace"]["root"], "C:/work/project");
+        assert_eq!(
+            spec["requiredCapabilities"],
+            json!(["shell", "fleet-chat-turn-v1"])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn remote_turn_rejects_conflicts_and_cancel_is_terminal() -> Result<()> {
+        let hub = tempfile::tempdir()?;
+        let enrollment = body(create_enrollment(hub.path(), Some("{}"))?);
+        body(enroll(
+            hub.path(),
+            Some(
+                &json!({
+                    "nodeId": "node_windows",
+                    "enrollmentCredential": enrollment["credential"],
+                    "protocolVersion": PROTOCOL
+                })
+                .to_string(),
+            ),
+        )?);
+        advertise_remote_turn_capability(hub.path(), "node_windows")?;
+        let request = |prompt: &str| {
+            json!({
+                "turnId": "turn_cancel",
+                "targetNodeId": "node_windows",
+                "familiarId": "sage",
+                "harness": "codex",
+                "workspace": {"root": "C:/work/project"},
+                "prompt": prompt,
+                "permissionMode": "full"
+            })
+            .to_string()
+        };
+        let queued = body(queue_remote_turn_job(hub.path(), Some(&request("one")))?);
+        assert_eq!(queued["state"], "queued");
+        let conflict = body(queue_remote_turn_job(hub.path(), Some(&request("two")))?);
+        assert_eq!(conflict["error"]["code"], "remote_turn_conflict");
+
+        let cancelled = body(cancel_fleet_job(hub.path(), "fleetturn_turn_cancel")?);
+        assert_eq!(cancelled["state"], "cancelled");
+        let cancelled_again = body(cancel_fleet_job(hub.path(), "fleetturn_turn_cancel")?);
+        assert_eq!(cancelled_again["state"], "cancelled");
+        assert_eq!(
+            body(list_fleet_jobs(hub.path())?)["jobs"][0]["state"],
+            "cancelled"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn remote_turn_fails_before_dispatch_for_offline_or_incompatible_executor() -> Result<()> {
+        let hub = tempfile::tempdir()?;
+        let enrollment = body(create_enrollment(hub.path(), Some("{}"))?);
+        body(enroll(
+            hub.path(),
+            Some(
+                &json!({
+                    "nodeId": "node_windows",
+                    "enrollmentCredential": enrollment["credential"],
+                    "protocolVersion": PROTOCOL
+                })
+                .to_string(),
+            ),
+        )?);
+        let request = json!({
+            "turnId": "turn_preflight",
+            "targetNodeId": "node_windows",
+            "familiarId": "sage",
+            "harness": "codex",
+            "workspace": {"root": "C:/work/project"},
+            "prompt": "hello",
+            "permissionMode": "read"
+        })
+        .to_string();
+        let incompatible = body(queue_remote_turn_job(hub.path(), Some(&request))?);
+        assert_eq!(incompatible["error"]["code"], "executor_incompatible");
+        advertise_remote_turn_capability(hub.path(), "node_windows")?;
+        open(hub.path())?.execute(
+            "UPDATE fleet_trusted_nodes SET last_seen_at=?1 WHERE node_id='node_windows'",
+            [(Utc::now() - Duration::seconds(30)).to_rfc3339()],
+        )?;
+        let offline = body(queue_remote_turn_job(hub.path(), Some(&request))?);
+        assert_eq!(offline["error"]["code"], "executor_offline");
+        let jobs = body(list_fleet_jobs(hub.path())?);
+        assert!(jobs["jobs"].as_array().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn remote_turn_events_are_authenticated_ordered_and_idempotent() -> Result<()> {
+        let hub = tempfile::tempdir()?;
+        let enrollment = body(create_enrollment(hub.path(), Some("{}"))?);
+        let enrolled = body(enroll(
+            hub.path(),
+            Some(
+                &json!({
+                    "nodeId": "node_windows",
+                    "enrollmentCredential": enrollment["credential"],
+                    "protocolVersion": PROTOCOL
+                })
+                .to_string(),
+            ),
+        )?);
+        let credential = enrolled["nodeCredential"].as_str().unwrap();
+        advertise_remote_turn_capability(hub.path(), "node_windows")?;
+        let queued = body(queue_remote_turn_job(
+            hub.path(),
+            Some(
+                &json!({
+                    "turnId": "turn_events",
+                    "targetNodeId": "node_windows",
+                    "familiarId": "sage",
+                    "harness": "codex",
+                    "workspace": {"root": "C:/work/project"},
+                    "prompt": "hello",
+                    "permissionMode": "read"
+                })
+                .to_string(),
+            ),
+        )?);
+        let challenge = body(create_challenge(
+            hub.path(),
+            Some(r#"{"nodeId":"node_windows"}"#),
+        )?);
+        let nonce = challenge["nonce"].as_str().unwrap();
+        let claimed = body(claim_fleet_job(
+            hub.path(),
+            Some(
+                &json!({
+                    "nodeId": "node_windows",
+                    "nonce": nonce,
+                    "proof": proof(credential, nonce),
+                    "capabilities": ["shell", "fleet-chat-turn-v1"]
+                })
+                .to_string(),
+            ),
+        )?);
+        assert_eq!(claimed["job"]["jobId"], queued["jobId"]);
+
+        let append = || -> Result<ApiResponse> {
+            let challenge = body(create_challenge(
+                hub.path(),
+                Some(r#"{"nodeId":"node_windows"}"#),
+            )?);
+            let nonce = challenge["nonce"].as_str().unwrap();
+            append_authenticated_fleet_job_events(
+                hub.path(),
+                Some(
+                    &json!({
+                        "nodeId": "node_windows",
+                        "nonce": nonce,
+                        "proof": proof(credential, nonce),
+                        "jobId": queued["jobId"],
+                        "events": [{
+                            "sequence": 1,
+                            "chunkBase64": base64::engine::general_purpose::STANDARD.encode(b"{\"type\":\"assistant\"}\n")
+                        }]
+                    })
+                    .to_string(),
+                ),
+            )
+        };
+        assert_eq!(append()?.status, 200);
+        assert_eq!(append()?.status, 200);
+        let events = body(list_local_fleet_job_events(
+            hub.path(),
+            queued["jobId"].as_str().unwrap(),
+        )?);
+        assert_eq!(events["events"].as_array().unwrap().len(), 1);
+        assert_eq!(events["events"][0]["sequence"], 1);
+        Ok(())
+    }
+
+    #[test]
+    fn remote_turn_validation_rejects_unbounded_or_unsafe_fields() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let invalid = body(queue_remote_turn_job(
+            home.path(),
+            Some(
+                &json!({
+                    "turnId": "turn\r\nheader",
+                    "targetNodeId": "node_windows",
+                    "familiarId": "sage",
+                    "harness": "codex",
+                    "workspace": {"root": "C:/work/project"},
+                    "prompt": "hello",
+                    "permissionMode": "full"
+                })
+                .to_string(),
+            ),
+        )?);
+        assert_eq!(invalid["error"]["code"], "invalid_remote_turn");
+        Ok(())
+    }
+
+    #[test]
     fn denied_pairing_never_creates_trust() -> Result<()> {
         let home = tempfile::tempdir()?;
         let requested = body(request_pairing(
@@ -1622,6 +2793,105 @@ mod tests {
             negotiate(Some(r#"{"protocolVersions":["coven.fleet.v2"]}"#))?.status,
             409
         );
+        Ok(())
+    }
+
+    #[test]
+    fn remote_turn_preparation_materializes_bounded_portable_context() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let workspace = tempfile::tempdir()?;
+        let spec = crate::executor_node::ExecutorJob {
+            protocol_version: crate::executor_node::EXECUTOR_PROTOCOL_VERSION.to_string(),
+            job_id: "fleetturn_prepare".to_string(),
+            hub_id: Some("hub_mac".to_string()),
+            required_capabilities: vec!["shell".to_string(), "fleet-chat-turn-v1".to_string()],
+            command: vec!["coven:fleet-chat-turn".to_string()],
+            cwd: None,
+            env: Default::default(),
+            stdin: None,
+            timeout_seconds: Some(120),
+            context: Some(json!({
+                "kind": "fleet-chat-turn",
+                "schemaVersion": "coven.fleet.chat-turn.v1",
+                "turnId": "turn_prepare",
+                "familiarId": "sage",
+                "harness": "codex",
+                "workspace": {"root": workspace.path()},
+                "prompt": "Current question",
+                "contextMessages": [{"role": "assistant", "text": "Prior answer"}],
+                "attachments": [{
+                    "name": "../notes.txt",
+                    "mimeType": "text/plain",
+                    "dataBase64": base64::engine::general_purpose::STANDARD.encode(b"hello")
+                }],
+                "permissionMode": "read"
+            })),
+        };
+        let (execution, attachment_root) = remote_turn_execution_job(home.path(), &spec)
+            .map_err(|response| anyhow::anyhow!(response.body))?;
+        assert_eq!(
+            execution.cwd.as_deref(),
+            Some(workspace.path().to_string_lossy().as_ref())
+        );
+        assert!(execution
+            .command
+            .iter()
+            .any(|arg| arg.contains("Prior answer")));
+        assert!(execution
+            .command
+            .iter()
+            .any(|arg| arg.contains("Current question")));
+        let files = fs::read_dir(&attachment_root)?.collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(files.len(), 1);
+        assert_eq!(fs::read(files[0].path())?, b"hello");
+        assert!(!files[0].file_name().to_string_lossy().contains('/'));
+        fs::remove_dir_all(attachment_root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn completed_remote_turn_receipt_is_replayed_without_execution() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        configure_local_role(
+            home.path(),
+            Some(r#"{"role":"executor","capabilities":["shell","fleet-chat-turn-v1"]}"#),
+        )?;
+        configure_local_sharing(home.path(), Some(r#"{"enabled":true}"#))?;
+        local_lifecycle(home.path(), "start", None)?;
+        let spec = json!({
+            "protocolVersion": crate::executor_node::EXECUTOR_PROTOCOL_VERSION,
+            "jobId": "fleetturn_replay",
+            "requiredCapabilities": ["shell", "fleet-chat-turn-v1"],
+            "command": ["coven:fleet-chat-turn"],
+            "env": {},
+            "context": {"kind": "fleet-chat-turn"}
+        });
+        let parsed_spec: crate::executor_node::ExecutorJob = serde_json::from_value(spec.clone())?;
+        let spec_hash = hash(&serde_json::to_string(&parsed_spec)?);
+        let cached = json!({
+            "protocolVersion": crate::executor_node::EXECUTOR_PROTOCOL_VERSION,
+            "jobId": "fleetturn_replay",
+            "status": "completed",
+            "exitCode": 0,
+            "stdout": "cached",
+            "stderr": "",
+            "startedAt": "2026-08-14T00:00:00Z",
+            "finishedAt": "2026-08-14T00:00:01Z",
+            "durationMs": 1000
+        });
+        open(home.path())?.execute(
+            "INSERT INTO fleet_execution_receipts
+             (job_id, spec_hash, state, result_json, started_at, completed_at)
+             VALUES (?1, ?2, 'completed', ?3, ?4, ?4)",
+            params![
+                "fleetturn_replay",
+                spec_hash,
+                cached.to_string(),
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        let replayed = body(run_local_fleet_job(home.path(), Some(&spec.to_string()))?);
+        assert_eq!(replayed["stdout"], "cached");
         Ok(())
     }
 }

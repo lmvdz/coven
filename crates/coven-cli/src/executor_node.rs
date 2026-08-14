@@ -22,6 +22,7 @@ use std::{
     io::{Read, Write},
     path::Path,
     process::Stdio,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -39,6 +40,7 @@ pub const RESULT_STATUS_FAILED: &str = "failed";
 pub const RESULT_STATUS_TIMEOUT: &str = "timeout";
 pub const RESULT_STATUS_REJECTED: &str = "rejected";
 pub const RESULT_STATUS_TRANSPORT_ERROR: &str = "transport_error";
+pub const RESULT_STATUS_CANCELLED: &str = "cancelled";
 
 pub const DEFAULT_JOB_TIMEOUT_SECONDS: u64 = 300;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -110,6 +112,9 @@ pub struct ExecutorResultEnvelope {
     pub duration_ms: i64,
     #[serde(default)]
     pub error: Option<String>,
+    /** Reserved typed discovery channel for executor-launched services. */
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_advertisements: Vec<Value>,
 }
 
 /// Hub-side node link configuration persisted in the node registry.
@@ -282,7 +287,8 @@ impl ExecutorTransport for SshTransport {
         let argv = self.argv(protocol_args);
         let mut command = std::process::Command::new(&argv[0]);
         command.args(&argv[1..]);
-        run_process_with_timeout(&mut command, stdin, timeout)
+        run_process_with_timeout(&mut command, stdin, timeout, &|| false, None)
+            .map(|(output, _)| output)
             .with_context(|| format!("ssh dispatch to {} failed", self.describe()))
     }
 }
@@ -308,7 +314,8 @@ impl ExecutorTransport for LocalProcessTransport {
         let mut command = std::process::Command::new(&self.program);
         command.args(&self.args);
         command.args(protocol_args);
-        run_process_with_timeout(&mut command, stdin, timeout)
+        run_process_with_timeout(&mut command, stdin, timeout, &|| false, None)
+            .map(|(output, _)| output)
             .with_context(|| format!("local dispatch via {} failed", self.program))
     }
 }
@@ -457,6 +464,7 @@ fn transport_error_envelope(
         finished_at: current_timestamp(),
         duration_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
         error: Some(error),
+        service_advertisements: Vec::new(),
     }
 }
 
@@ -529,6 +537,25 @@ pub fn run_job_from_stdin_payload(payload: &str) -> ExecutorResultEnvelope {
 /// Runs one dispatched job. Deliberately stateless: no store access, no
 /// hub-authoritative writes — the job spec is the entire context.
 pub fn run_job(job: &ExecutorJob) -> ExecutorResultEnvelope {
+    run_job_with_cancellation(job, || false)
+}
+
+pub fn run_job_with_cancellation<F>(job: &ExecutorJob, should_cancel: F) -> ExecutorResultEnvelope
+where
+    F: Fn() -> bool,
+{
+    run_job_observed(job, should_cancel, |_| {})
+}
+
+pub fn run_job_observed<F, O>(
+    job: &ExecutorJob,
+    should_cancel: F,
+    on_stdout: O,
+) -> ExecutorResultEnvelope
+where
+    F: Fn() -> bool,
+    O: Fn(&[u8]) + Send + Sync + 'static,
+{
     if job.protocol_version != EXECUTOR_PROTOCOL_VERSION {
         return rejected_envelope(
             &job.job_id,
@@ -564,7 +591,14 @@ pub fn run_job(job: &ExecutorJob) -> ExecutorResultEnvelope {
         command.env(key, value);
     }
     let timeout = Duration::from_secs(job.timeout_seconds.unwrap_or(DEFAULT_JOB_TIMEOUT_SECONDS));
-    let output = match run_process_with_timeout(&mut command, job.stdin.as_deref(), timeout) {
+    let observer: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(on_stdout);
+    let (output, cancelled) = match run_process_with_timeout(
+        &mut command,
+        job.stdin.as_deref(),
+        timeout,
+        &should_cancel,
+        Some(observer),
+    ) {
         Ok(output) => output,
         Err(error) => {
             return rejected_envelope(
@@ -573,7 +607,9 @@ pub fn run_job(job: &ExecutorJob) -> ExecutorResultEnvelope {
             );
         }
     };
-    let status = if output.timed_out {
+    let status = if cancelled {
+        RESULT_STATUS_CANCELLED
+    } else if output.timed_out {
         RESULT_STATUS_TIMEOUT
     } else if output.exit_code == Some(0) {
         RESULT_STATUS_COMPLETED
@@ -590,11 +626,20 @@ pub fn run_job(job: &ExecutorJob) -> ExecutorResultEnvelope {
         started_at,
         finished_at: current_timestamp(),
         duration_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
-        error: if output.timed_out {
+        error: if cancelled {
+            Some("job was cancelled".to_string())
+        } else if output.timed_out {
             Some(format!("job exceeded timeout of {}s", timeout.as_secs()))
         } else {
             None
         },
+        service_advertisements: job
+            .context
+            .as_ref()
+            .and_then(|context| context.get("serviceAdvertisements"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
     }
 }
 
@@ -611,6 +656,7 @@ fn rejected_envelope(job_id: &str, error: String) -> ExecutorResultEnvelope {
         finished_at: now,
         duration_ms: 0,
         error: Some(error),
+        service_advertisements: Vec::new(),
     }
 }
 
@@ -622,7 +668,14 @@ fn run_process_with_timeout(
     command: &mut std::process::Command,
     stdin: Option<&str>,
     timeout: Duration,
-) -> Result<ProcessOutput> {
+    should_cancel: &dyn Fn() -> bool,
+    stdout_observer: Option<Arc<dyn Fn(&[u8]) + Send + Sync>>,
+) -> Result<(ProcessOutput, bool)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     command
         .stdin(if stdin.is_some() {
             Stdio::piped()
@@ -640,18 +693,27 @@ fn run_process_with_timeout(
             let _ = handle.write_all(&payload);
         })
     });
-    let stdout_reader = spawn_capped_reader(child.stdout.take().expect("stdout is piped"));
-    let stderr_reader = spawn_capped_reader(child.stderr.take().expect("stderr is piped"));
+    let stdout_reader = spawn_capped_reader(
+        child.stdout.take().expect("stdout is piped"),
+        stdout_observer,
+    );
+    let stderr_reader = spawn_capped_reader(child.stderr.take().expect("stderr is piped"), None);
 
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
+    let mut cancelled = false;
     let exit_status = loop {
         match child.try_wait().context("failed to poll process")? {
             Some(status) => break Some(status),
             None => {
+                if should_cancel() {
+                    cancelled = true;
+                    kill_process_tree(&mut child);
+                    break child.wait().ok();
+                }
                 if Instant::now() >= deadline {
                     timed_out = true;
-                    let _ = child.kill();
+                    kill_process_tree(&mut child);
                     break child.wait().ok();
                 }
                 std::thread::sleep(Duration::from_millis(25));
@@ -672,15 +734,38 @@ fn run_process_with_timeout(
     } else {
         exit_status.and_then(|status| status.code()).map(i64::from)
     };
-    Ok(ProcessOutput {
-        exit_code,
-        stdout,
-        stderr,
-        timed_out,
-    })
+    Ok((
+        ProcessOutput {
+            exit_code,
+            stdout,
+            stderr,
+            timed_out,
+        },
+        cancelled,
+    ))
 }
 
-fn spawn_capped_reader<R: Read + Send + 'static>(mut source: R) -> std::thread::JoinHandle<String> {
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+}
+
+fn spawn_capped_reader<R: Read + Send + 'static>(
+    mut source: R,
+    observer: Option<Arc<dyn Fn(&[u8]) + Send + Sync>>,
+) -> std::thread::JoinHandle<String> {
     std::thread::spawn(move || {
         let mut buffer = Vec::new();
         let mut chunk = [0u8; 8192];
@@ -688,6 +773,9 @@ fn spawn_capped_reader<R: Read + Send + 'static>(mut source: R) -> std::thread::
             match source.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(read) => {
+                    if let Some(observer) = &observer {
+                        observer(&chunk[..read]);
+                    }
                     let remaining = MAX_CAPTURED_OUTPUT_BYTES.saturating_sub(buffer.len());
                     let take = read.min(remaining);
                     buffer.extend_from_slice(&chunk[..take]);
@@ -708,6 +796,10 @@ fn spawn_capped_reader<R: Read + Send + 'static>(mut source: R) -> std::thread::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
 
     fn shell_command(script: &str) -> Vec<String> {
         #[cfg(unix)]
@@ -733,6 +825,22 @@ mod tests {
             timeout_seconds: Some(30),
             context: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observed_job_streams_stdout_and_honors_cancellation() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&observed);
+        let polls = AtomicUsize::new(0);
+        let job = job_with_command(shell_command("printf 'hello\\n'; sleep 5"));
+        let result = run_job_observed(
+            &job,
+            || polls.fetch_add(1, Ordering::Relaxed) > 3,
+            move |chunk| sink.lock().unwrap().extend_from_slice(chunk),
+        );
+        assert_eq!(result.status, RESULT_STATUS_CANCELLED);
+        assert!(String::from_utf8_lossy(&observed.lock().unwrap()).contains("hello"));
     }
 
     #[test]
@@ -1051,6 +1159,7 @@ mod tests {
             finished_at: "2026-07-06T00:00:01Z".to_string(),
             duration_ms: 1000,
             error: None,
+            service_advertisements: Vec::new(),
         })
         .expect("envelope serializes")
     }

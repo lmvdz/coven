@@ -838,12 +838,44 @@ pub(crate) fn handle_request_with_runtime_and_authority(
         ("POST", "/fleet/challenges") => crate::fleet::create_challenge(coven_home, body),
         ("POST", "/fleet/reconnect") => crate::fleet::reconnect(coven_home, body),
         ("POST", "/fleet/jobs/claim") => crate::fleet::claim_fleet_job(coven_home, body),
+        ("POST", "/fleet/jobs/status") => {
+            crate::fleet::authenticated_fleet_job_status(coven_home, body)
+        }
+        ("POST", "/fleet/jobs/events") => {
+            crate::fleet::append_authenticated_fleet_job_events(coven_home, body)
+        }
         ("POST", "/fleet/jobs/complete") => crate::fleet::complete_fleet_job(coven_home, body),
         ("POST", "/fleet/local-jobs/system-info") => {
             crate::fleet::queue_system_info_job(coven_home, body)
         }
+        ("POST", "/fleet/local-jobs/remote-turn") => {
+            crate::fleet::queue_remote_turn_job(coven_home, body)
+        }
+        ("POST", path) if path.starts_with("/fleet/local-jobs/") && path.ends_with("/cancel") => {
+            crate::fleet::cancel_fleet_job(
+                coven_home,
+                path.trim_start_matches("/fleet/local-jobs/")
+                    .trim_end_matches("/cancel"),
+            )
+        }
         ("GET", "/fleet/local-jobs") => crate::fleet::list_fleet_jobs(coven_home),
+        ("GET", path) if path.starts_with("/fleet/local-jobs/") && path.ends_with("/events") => {
+            crate::fleet::list_local_fleet_job_events(
+                coven_home,
+                path.trim_start_matches("/fleet/local-jobs/")
+                    .trim_end_matches("/events"),
+            )
+        }
         ("POST", "/fleet/local-jobs/run") => crate::fleet::run_local_fleet_job(coven_home, body),
+        ("POST", path)
+            if path.starts_with("/fleet/local-executions/") && path.ends_with("/cancel") =>
+        {
+            crate::fleet::cancel_local_fleet_execution(
+                coven_home,
+                path.trim_start_matches("/fleet/local-executions/")
+                    .trim_end_matches("/cancel"),
+            )
+        }
         ("GET", "/fleet/trusted-nodes") => crate::fleet::list_trusted_nodes(coven_home),
         ("POST", path)
             if path.starts_with("/fleet/trusted-nodes/") && path.ends_with("/revoke") =>
