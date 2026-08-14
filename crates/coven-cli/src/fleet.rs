@@ -7,7 +7,9 @@
 
 use std::{
     fs,
-    path::Path,
+    io::Write,
+    path::{Component, Path, PathBuf},
+    process::{Command, Stdio},
     sync::{
         atomic::{AtomicI64, Ordering},
         Arc,
@@ -32,9 +34,12 @@ const CHALLENGE_TTL_SECONDS: i64 = 60;
 const JOB_LEASE_TTL_SECONDS: i64 = 60;
 const MAX_REMOTE_TURN_PROMPT_BYTES: usize = 256 * 1024;
 const MAX_REMOTE_TURN_CONTEXT_MESSAGES: usize = 256;
-const MAX_REMOTE_TURN_CONTEXT_BYTES: usize = 1024 * 1024;
+const MAX_REMOTE_TURN_CONTEXT_BYTES: usize = 768 * 1024;
 const MAX_REMOTE_TURN_ATTACHMENTS: usize = 8;
-const MAX_REMOTE_TURN_ATTACHMENT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_REMOTE_TURN_ATTACHMENT_BYTES: usize = 768 * 1024;
+const MAX_REMOTE_TURN_WORKSPACE_BYTES: usize = 768 * 1024;
+const MAX_REMOTE_TURN_ENCODED_BINARY_BYTES: usize = MAX_REMOTE_TURN_WORKSPACE_BYTES.div_ceil(3) * 4;
+const MAX_REMOTE_TURN_UNTRACKED_FILES: usize = 256;
 const MAX_REMOTE_TURN_FIELD_BYTES: usize = 4096;
 
 fn store_path(home: &Path) -> std::path::PathBuf {
@@ -1069,6 +1074,28 @@ struct RemoteTurnWorkspace {
     repository_url: Option<String>,
     #[serde(default)]
     checkpoint: Option<String>,
+    #[serde(default)]
+    subdirectory: Option<String>,
+    #[serde(default)]
+    overlay: Option<RemoteTurnWorkspaceOverlay>,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteTurnWorkspaceOverlay {
+    patch_base64: String,
+    digest: String,
+    #[serde(default)]
+    untracked_files: Vec<RemoteTurnWorkspaceFile>,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteTurnWorkspaceFile {
+    path: String,
+    data_base64: String,
+    #[serde(default)]
+    executable: bool,
 }
 
 #[derive(Deserialize, serde::Serialize)]
@@ -1099,6 +1126,7 @@ fn valid_remote_identifier(value: &str) -> bool {
 
 fn valid_remote_token(value: &str) -> bool {
     bounded_remote_field(value)
+        && value != "."
         && !value.contains("..")
         && value
             .bytes()
@@ -1136,8 +1164,38 @@ fn validate_remote_turn(request: &QueueRemoteTurn) -> std::result::Result<(), &'
             .checkpoint
             .as_deref()
             .is_some_and(|value| !valid_remote_token(value))
+        || request
+            .workspace
+            .subdirectory
+            .as_deref()
+            .is_some_and(|value| {
+                !bounded_remote_field(value)
+                    || value.starts_with('/')
+                    || value.starts_with('\\')
+                    || value.split(['/', '\\']).any(|part| part == "..")
+            })
     {
         return Err("remote turn workspace is invalid");
+    }
+    if let Some(overlay) = request.workspace.overlay.as_ref() {
+        let encoded_bytes = overlay.patch_base64.len()
+            + overlay
+                .untracked_files
+                .iter()
+                .map(|file| file.data_base64.len())
+                .sum::<usize>();
+        if !valid_remote_token(&overlay.digest)
+            || overlay.untracked_files.len() > MAX_REMOTE_TURN_UNTRACKED_FILES
+            || encoded_bytes > MAX_REMOTE_TURN_ENCODED_BINARY_BYTES
+            || overlay.untracked_files.iter().any(|file| {
+                !bounded_remote_field(&file.path)
+                    || file.path.starts_with('/')
+                    || file.path.starts_with('\\')
+                    || file.path.split(['/', '\\']).any(|part| part == "..")
+            })
+        {
+            return Err("remote turn workspace overlay is invalid");
+        }
     }
     if !matches!(request.permission_mode.as_str(), "read" | "full") {
         return Err("remote turn permission mode is invalid");
@@ -1166,10 +1224,14 @@ fn validate_remote_turn(request: &QueueRemoteTurn) -> std::result::Result<(), &'
         return Err("remote turn context is too large");
     }
     if request.attachments.iter().any(|attachment| {
-        !bounded_remote_field(&attachment.name)
-            || !bounded_remote_field(&attachment.mime_type)
-            || attachment.data_base64.len() > MAX_REMOTE_TURN_ATTACHMENT_BYTES * 2
-    }) {
+        !bounded_remote_field(&attachment.name) || !bounded_remote_field(&attachment.mime_type)
+    }) || request
+        .attachments
+        .iter()
+        .map(|attachment| attachment.data_base64.len())
+        .sum::<usize>()
+        > MAX_REMOTE_TURN_ENCODED_BINARY_BYTES
+    {
         return Err("remote turn attachment is invalid");
     }
     Ok(())
@@ -1184,14 +1246,12 @@ pub fn queue_remote_turn_job(home: &Path, body: Option<&str>) -> Result<ApiRespo
         return api_error(400, "invalid_remote_turn", message, None);
     }
     let conn = open(home)?;
-    let trusted: Option<(String, String, String, Option<String>)> = conn.query_row(
-        "SELECT last_seen_at, capabilities_json, executor_availability, workspace_inventory_json FROM fleet_trusted_nodes WHERE node_id=?1 AND revoked_at IS NULL",
+    let trusted: Option<(String, String, String)> = conn.query_row(
+        "SELECT last_seen_at, capabilities_json, executor_availability FROM fleet_trusted_nodes WHERE node_id=?1 AND revoked_at IS NULL",
         [&request.target_node_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     ).optional()?;
-    let Some((last_seen_at, capabilities_json, executor_availability, workspace_inventory_json)) =
-        trusted
-    else {
+    let Some((last_seen_at, capabilities_json, executor_availability)) = trusted else {
         return api_error(
             404,
             "node_untrusted",
@@ -1215,13 +1275,13 @@ pub fn queue_remote_turn_job(home: &Path, body: Option<&str>) -> Result<ApiRespo
     let capabilities: Vec<String> = serde_json::from_str(&capabilities_json).unwrap_or_default();
     if !capabilities
         .iter()
-        .any(|value| value == "fleet-chat-turn-v1")
+        .any(|value| value == "fleet-managed-workspace-v1")
     {
         return api_error(
             409,
             "executor_incompatible",
             "Update Coven on the selected Fleet executor, then let it reconnect.",
-            Some(json!({"requiredCapability": "fleet-chat-turn-v1"})),
+            Some(json!({"requiredCapability": "fleet-managed-workspace-v1"})),
         );
     }
     let unavailable = match executor_availability.as_str() {
@@ -1255,53 +1315,6 @@ pub fn queue_remote_turn_job(home: &Path, body: Option<&str>) -> Result<ApiRespo
             Some(json!({"nodeId": request.target_node_id, "availability": executor_availability})),
         );
     }
-    let Some(workspace_inventory_json) = workspace_inventory_json else {
-        return api_error(
-            409,
-            "executor_workspace_inventory_unknown",
-            "Refresh Cave on the selected Fleet executor so it can advertise registered workspaces.",
-            Some(json!({"nodeId": request.target_node_id})),
-        );
-    };
-    let inventory: Vec<FleetWorkspaceAdvertisement> =
-        serde_json::from_str(&workspace_inventory_json).unwrap_or_default();
-    let matches: Vec<&FleetWorkspaceAdvertisement> =
-        if let Some(repository_url) = request.workspace.repository_url.as_deref() {
-            inventory
-                .iter()
-                .filter(|workspace| workspace.repository_url.as_deref() == Some(repository_url))
-                .collect()
-        } else if let Some(project_name) = request.workspace.project_name.as_deref() {
-            inventory
-                .iter()
-                .filter(|workspace| {
-                    workspace
-                        .project_name
-                        .as_deref()
-                        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(project_name))
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-    if matches.len() != 1 {
-        return api_error(
-            409,
-            "executor_workspace_missing",
-            "The selected Fleet executor does not have this project registered uniquely. Add the project there, then retry.",
-            Some(json!({"nodeId": request.target_node_id, "projectName": request.workspace.project_name, "repositoryUrl": request.workspace.repository_url})),
-        );
-    }
-    if let Some(checkpoint) = request.workspace.checkpoint.as_deref() {
-        if matches[0].checkpoint.as_deref() != Some(checkpoint) {
-            return api_error(
-                409,
-                "executor_workspace_checkpoint_mismatch",
-                "The executor project is on a different revision. Update it to the hub checkpoint, then retry.",
-                Some(json!({"nodeId": request.target_node_id, "expectedCheckpoint": checkpoint, "actualCheckpoint": matches[0].checkpoint})),
-            );
-        }
-    }
     let job_id = format!("fleetturn_{}", request.turn_id);
     let existing: Option<(String, String)> = conn
         .query_row(
@@ -1328,7 +1341,7 @@ pub fn queue_remote_turn_job(home: &Path, body: Option<&str>) -> Result<ApiRespo
         "protocolVersion": crate::executor_node::EXECUTOR_PROTOCOL_VERSION,
         "jobId": job_id,
         "hubId": load_or_create_local_node(&conn)?.device_id,
-        "requiredCapabilities": ["shell", "fleet-chat-turn-v1"],
+        "requiredCapabilities": ["shell", "fleet-chat-turn-v1", "fleet-managed-workspace-v1"],
         "command": ["coven:fleet-chat-turn"],
         "env": {},
         "context": context,
@@ -1844,6 +1857,354 @@ fn remote_turn_attachment_name(name: &str, index: usize) -> String {
     )
 }
 
+fn valid_github_repository_url(value: &str) -> bool {
+    let Some(slug) = value.strip_prefix("https://github.com/") else {
+        return false;
+    };
+    if slug.contains(['?', '#', '@']) || slug.ends_with(".git") {
+        return false;
+    }
+    let mut parts = slug.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let repository = parts.next().unwrap_or_default();
+    parts.next().is_none()
+        && !owner.is_empty()
+        && owner.len() <= 39
+        && !owner.starts_with('-')
+        && !owner.ends_with('-')
+        && owner
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && !repository.is_empty()
+        && repository.len() <= 100
+        && repository
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        && repository != "."
+        && repository != ".."
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[usize::from(*byte) >> 4] as char);
+        encoded.push(HEX[usize::from(*byte) & 0x0f] as char);
+    }
+    encoded
+}
+
+fn managed_turn_directory(turn_id: &str) -> String {
+    let digest = Sha256::digest(turn_id.as_bytes());
+    format!("turn-{}", &hex_bytes(&digest)[..32])
+}
+
+fn safe_workspace_relative_path(value: &str) -> Option<PathBuf> {
+    if value.trim().is_empty() || value.contains('\\') {
+        return None;
+    }
+    let path = Path::new(value);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(path.to_path_buf())
+}
+
+fn git_ok(cwd: &Path, args: &[&str]) -> bool {
+    Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn fleet_workspace_error(code: &str, message: &str, turn_id: &str) -> ApiResponse {
+    api_error(409, code, message, Some(json!({"turnId": turn_id})))
+        .expect("serialize Fleet workspace error")
+}
+
+fn prepare_remote_turn_workspace(
+    home: &Path,
+    workspace_value: &Value,
+    turn_id: &str,
+) -> std::result::Result<PathBuf, ApiResponse> {
+    let workspace: RemoteTurnWorkspace =
+        serde_json::from_value(workspace_value.clone()).map_err(|_| {
+            fleet_workspace_error(
+                "remote_workspace_invalid",
+                "The hub supplied an invalid Fleet workspace specification.",
+                turn_id,
+            )
+        })?;
+    let repository_url = workspace.repository_url.as_deref().filter(|value| {
+        valid_github_repository_url(value)
+    }).ok_or_else(|| {
+        fleet_workspace_error(
+            "remote_repository_required",
+            "This project has no supported GitHub remote. Add a GitHub remote on the hub, then retry.",
+            turn_id,
+        )
+    })?;
+    let checkpoint = workspace
+        .checkpoint
+        .as_deref()
+        .filter(|value| value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| {
+            fleet_workspace_error(
+            "remote_checkpoint_required",
+            "This project has no portable Git checkpoint. Commit the project state, then retry.",
+            turn_id,
+        )
+        })?;
+    let mut repository_digest = Sha256::new();
+    repository_digest.update(repository_url.as_bytes());
+    let repository_key = hex_bytes(&repository_digest.finalize());
+    let managed_root = home.join("fleet-workspaces").join(&repository_key[..32]);
+    let checkout = managed_root.join(managed_turn_directory(turn_id));
+    fs::create_dir_all(&managed_root).map_err(|_| {
+        fleet_workspace_error(
+            "remote_workspace_prepare_failed",
+            "Fleet could not create its managed workspace on this executor.",
+            turn_id,
+        )
+    })?;
+    let git_dir = checkout.join(".git");
+    if !git_dir.is_dir() {
+        if checkout.exists() {
+            fs::remove_dir_all(&checkout).map_err(|_| {
+                fleet_workspace_error(
+                    "remote_workspace_prepare_failed",
+                    "Fleet could not reset its managed workspace on this executor.",
+                    turn_id,
+                )
+            })?;
+        }
+        let cloned = Command::new("git")
+            .args(["clone", "--no-checkout", repository_url])
+            .arg(&checkout)
+            .current_dir(&managed_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !cloned {
+            return Err(fleet_workspace_error(
+                "remote_repository_unavailable",
+                "Fleet could not prepare this repository on the executor. Sign in to Git for this repository on that device, then retry.",
+                turn_id,
+            ));
+        }
+    }
+    if git_stdout(&checkout, &["config", "--get", "remote.origin.url"]).as_deref()
+        != Some(repository_url)
+    {
+        return Err(fleet_workspace_error(
+            "remote_workspace_identity_mismatch",
+            "Fleet's managed checkout does not match this repository. Retry after removing the stale managed checkout.",
+            turn_id,
+        ));
+    }
+    if !git_ok(&checkout, &["fetch", "--prune", "--no-tags", "origin"])
+        || !git_ok(&checkout, &["checkout", "--detach", "--force", checkpoint])
+        || !git_ok(&checkout, &["clean", "-ffdx"])
+    {
+        return Err(fleet_workspace_error(
+            "remote_repository_unavailable",
+            "Fleet could not prepare this repository on the executor. Sign in to Git for this repository on that device, then retry.",
+            turn_id,
+        ));
+    }
+
+    if let Some(overlay) = workspace.overlay {
+        let patch = base64::engine::general_purpose::STANDARD
+            .decode(&overlay.patch_base64)
+            .map_err(|_| {
+                fleet_workspace_error(
+                    "remote_workspace_integrity_failed",
+                    "The Fleet workspace changes failed integrity verification. Retry the turn from the hub.",
+                    turn_id,
+                )
+            })?;
+        let mut decoded_files = Vec::with_capacity(overlay.untracked_files.len());
+        let mut decoded_bytes = patch.len();
+        let mut digest = Sha256::new();
+        digest.update(&patch);
+        for file in overlay.untracked_files {
+            let Some(relative) = safe_workspace_relative_path(&file.path) else {
+                return Err(fleet_workspace_error(
+                    "remote_workspace_unsafe_path",
+                    "The Fleet workspace contains an unsafe path.",
+                    turn_id,
+                ));
+            };
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&file.data_base64)
+                .map_err(|_| {
+                    fleet_workspace_error(
+                        "remote_workspace_integrity_failed",
+                        "The Fleet workspace changes failed integrity verification. Retry the turn from the hub.",
+                        turn_id,
+                    )
+                })?;
+            decoded_bytes = decoded_bytes.saturating_add(bytes.len());
+            digest.update([0]);
+            digest.update(file.path.as_bytes());
+            digest.update([u8::from(file.executable)]);
+            digest.update(&bytes);
+            decoded_files.push((relative, bytes, file.executable));
+        }
+        if decoded_bytes > MAX_REMOTE_TURN_WORKSPACE_BYTES
+            || format!("sha256-{}", hex_bytes(&digest.finalize())) != overlay.digest
+        {
+            return Err(fleet_workspace_error(
+                "remote_workspace_integrity_failed",
+                "The Fleet workspace changes failed integrity verification. Retry the turn from the hub.",
+                turn_id,
+            ));
+        }
+        if !patch.is_empty() {
+            let mut child = Command::new("git")
+                .args(["apply", "--binary", "--whitespace=nowarn", "-"])
+                .current_dir(&checkout)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|_| {
+                    fleet_workspace_error(
+                        "remote_workspace_apply_failed",
+                        "Fleet could not apply the hub workspace changes safely. Commit or reduce the changes, then retry.",
+                        turn_id,
+                    )
+                })?;
+            let wrote = child
+                .stdin
+                .as_mut()
+                .is_some_and(|stdin| stdin.write_all(&patch).is_ok());
+            let applied = child.wait().is_ok_and(|status| status.success());
+            if !wrote || !applied {
+                return Err(fleet_workspace_error(
+                    "remote_workspace_apply_failed",
+                    "Fleet could not apply the hub workspace changes safely. Commit or reduce the changes, then retry.",
+                    turn_id,
+                ));
+            }
+        }
+        for (relative, bytes, executable) in decoded_files {
+            let destination = checkout.join(&relative);
+            let mut cursor = checkout.clone();
+            if let Some(parent) = relative.parent() {
+                for component in parent.components() {
+                    cursor.push(component.as_os_str());
+                    if cursor.exists() {
+                        if fs::symlink_metadata(&cursor)
+                            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                        {
+                            return Err(fleet_workspace_error(
+                                "remote_workspace_unsafe_path",
+                                "The Fleet workspace contains an unsafe path.",
+                                turn_id,
+                            ));
+                        }
+                    } else {
+                        fs::create_dir(&cursor).map_err(|_| {
+                            fleet_workspace_error(
+                                "remote_workspace_apply_failed",
+                                "Fleet could not apply the hub workspace changes safely. Commit or reduce the changes, then retry.",
+                                turn_id,
+                            )
+                        })?;
+                    }
+                }
+            }
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            let mut output = options.open(&destination).map_err(|_| {
+                fleet_workspace_error(
+                    "remote_workspace_apply_failed",
+                    "Fleet could not apply the hub workspace changes safely. Commit or reduce the changes, then retry.",
+                    turn_id,
+                )
+            })?;
+            output.write_all(&bytes).map_err(|_| {
+                fleet_workspace_error(
+                    "remote_workspace_apply_failed",
+                    "Fleet could not apply the hub workspace changes safely. Commit or reduce the changes, then retry.",
+                    turn_id,
+                )
+            })?;
+            #[cfg(unix)]
+            if executable {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).map_err(
+                    |_| {
+                        fleet_workspace_error(
+                            "remote_workspace_apply_failed",
+                            "Fleet could not apply the hub workspace changes safely. Commit or reduce the changes, then retry.",
+                            turn_id,
+                        )
+                    },
+                )?;
+            }
+        }
+    }
+    let cwd = if let Some(subdirectory) = workspace.subdirectory.as_deref() {
+        checkout.join(safe_workspace_relative_path(subdirectory).ok_or_else(|| {
+            fleet_workspace_error(
+                "remote_workspace_unsafe_path",
+                "The Fleet workspace contains an unsafe subdirectory.",
+                turn_id,
+            )
+        })?)
+    } else {
+        checkout.clone()
+    };
+    let checkout_canonical = checkout.canonicalize().map_err(|_| {
+        fleet_workspace_error(
+            "remote_workspace_prepare_failed",
+            "Fleet could not verify its managed workspace on this executor.",
+            turn_id,
+        )
+    })?;
+    let cwd_canonical = cwd.canonicalize().map_err(|_| {
+        fleet_workspace_error(
+            "remote_workspace_subdirectory_missing",
+            "The selected project folder does not exist at this repository revision.",
+            turn_id,
+        )
+    })?;
+    if !cwd_canonical.starts_with(&checkout_canonical) || !cwd_canonical.is_dir() {
+        return Err(fleet_workspace_error(
+            "remote_workspace_unsafe_path",
+            "The Fleet workspace contains an unsafe subdirectory.",
+            turn_id,
+        ));
+    }
+    Ok(cwd_canonical)
+}
+
 fn remote_turn_execution_job(
     home: &Path,
     spec: &crate::executor_node::ExecutorJob,
@@ -1900,52 +2261,16 @@ fn remote_turn_execution_job(
             .expect("serialize API error"))
         }
     };
-    let workspace_root = context
-        .get("workspace")
-        .and_then(|workspace| workspace.get("root"))
-        .and_then(Value::as_str)
-        .filter(|value| bounded_remote_field(value))
-        .ok_or_else(|| {
-            api_error(
-                400,
-                "remote_workspace_required",
-                "The remote turn needs a workspace on this executor.",
-                None,
-            )
-            .expect("serialize API error")
-        })?;
-    let workspace_path = Path::new(workspace_root);
-    if !workspace_path.is_absolute() || !workspace_path.is_dir() {
-        return Err(api_error(
-            409,
-            "remote_workspace_unavailable",
-            "The selected workspace is not available on this executor.",
-            Some(json!({"turnId": turn_id})),
+    let workspace = context.get("workspace").ok_or_else(|| {
+        api_error(
+            400,
+            "remote_workspace_required",
+            "The remote turn needs a workspace on this executor.",
+            None,
         )
-        .expect("serialize API error"));
-    }
-    if let Some(checkpoint) = context
-        .get("workspace")
-        .and_then(|workspace| workspace.get("checkpoint"))
-        .and_then(Value::as_str)
-    {
-        let current = std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(workspace_path)
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
-        if current.as_deref() != Some(checkpoint) {
-            return Err(api_error(
-                409,
-                "remote_workspace_checkpoint_mismatch",
-                "The executor workspace is on a different revision. Update it to the hub checkpoint, then retry.",
-                Some(json!({"turnId": turn_id, "expectedCheckpoint": checkpoint})),
-            )
-            .expect("serialize API error"));
-        }
-    }
+        .expect("serialize API error")
+    })?;
+    let workspace_path = prepare_remote_turn_workspace(home, workspace, turn_id)?;
 
     let attachments = context
         .get("attachments")
@@ -2006,7 +2331,9 @@ fn remote_turn_execution_job(
         .expect("serialize API error"));
     }
 
-    let attachment_root = home.join("fleet-turns").join(&spec.job_id);
+    let attachment_root = home
+        .join("fleet-turns")
+        .join(managed_turn_directory(&spec.job_id));
     if attachment_root.exists() {
         fs::remove_dir_all(&attachment_root).map_err(|_| {
             api_error(
@@ -2084,8 +2411,6 @@ fn remote_turn_execution_job(
         "run".to_string(),
         harness.to_string(),
         "--stream-json".to_string(),
-        "--familiar".to_string(),
-        familiar_id.to_string(),
         "--permission".to_string(),
         permission.to_string(),
     ];
@@ -2095,7 +2420,7 @@ fn remote_turn_execution_job(
     command.extend(["--".to_string(), portable_prompt]);
     let mut execution = spec.clone();
     execution.command = command;
-    execution.cwd = Some(workspace_root.to_string());
+    execution.cwd = Some(workspace_path.to_string_lossy().to_string());
     let local_device_id = open(home)
         .and_then(|conn| load_or_create_local_node(&conn))
         .map(|node| node.device_id)
@@ -2112,6 +2437,7 @@ fn remote_turn_execution_job(
         "kind": "fleet-chat-turn-result",
         "schemaVersion": "coven.fleet.chat-turn-result.v1",
         "turnId": turn_id,
+        "familiarId": familiar_id,
         "executorProvenance": {"deviceId": local_device_id},
         "serviceAdvertisements": []
     }));
@@ -2139,10 +2465,12 @@ pub fn run_local_fleet_job(home: &Path, body: Option<&str>) -> Result<ApiRespons
     let declared_capabilities: Vec<String> =
         serde_json::from_str(&node.capabilities_json).unwrap_or_default();
     let supports = |capability: &str| {
-        matches!(capability, "shell" | "fleet-chat-turn-v1")
-            || declared_capabilities
-                .iter()
-                .any(|value| value == capability)
+        matches!(
+            capability,
+            "shell" | "fleet-chat-turn-v1" | "fleet-managed-workspace-v1"
+        ) || declared_capabilities
+            .iter()
+            .any(|value| value == capability)
     };
     if let Some(missing) = spec
         .required_capabilities
@@ -2323,13 +2651,73 @@ mod tests {
         open(home)?.execute(
             "UPDATE fleet_trusted_nodes SET capabilities_json=?1, last_seen_at=?2, workspace_inventory_json=?3 WHERE node_id=?4",
             params![
-                r#"["shell","fleet-chat-turn-v1"]"#,
+                r#"["shell","fleet-chat-turn-v1","fleet-managed-workspace-v1"]"#,
                 Utc::now().to_rfc3339(),
                 r#"[{"projectName":"Cave","checkpoint":"abc123"}]"#,
                 node_id
             ],
         )?;
         Ok(())
+    }
+
+    fn fixture_git(cwd: &Path, args: &[&str]) -> Result<String> {
+        let output = Command::new("git").args(args).current_dir(cwd).output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "fixture git command failed: {args:?}"
+        );
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    fn managed_workspace_fixture(home: &Path) -> Result<(String, String, PathBuf, PathBuf)> {
+        let repository_url = "https://github.com/example/fleet-managed-fixture".to_string();
+        let bare = home.join("fixture-remote.git");
+        let seed = home.join("fixture-seed");
+        fs::create_dir_all(seed.join("packages/app"))?;
+        fixture_git(home, &["init", "--bare", bare.to_string_lossy().as_ref()])?;
+        fixture_git(&seed, &["init"])?;
+        fixture_git(&seed, &["config", "user.name", "Fleet Test"])?;
+        fixture_git(&seed, &["config", "user.email", "fleet@example.test"])?;
+        fs::write(seed.join("packages/app/tracked.txt"), "base\n")?;
+        fixture_git(&seed, &["add", "."])?;
+        fixture_git(&seed, &["commit", "-m", "base"])?;
+        let checkpoint = fixture_git(&seed, &["rev-parse", "HEAD"])?;
+        fixture_git(
+            &seed,
+            &["remote", "add", "origin", bare.to_string_lossy().as_ref()],
+        )?;
+        fixture_git(&seed, &["push", "origin", "HEAD:refs/heads/main"])?;
+        let mut digest = Sha256::new();
+        digest.update(repository_url.as_bytes());
+        let key = hex_bytes(&digest.finalize());
+        let managed_root = home.join("fleet-workspaces").join(&key[..32]);
+        let checkout = managed_root.join(managed_turn_directory("turn_prepare"));
+        fs::create_dir_all(&managed_root)?;
+        fixture_git(
+            &managed_root,
+            &[
+                "clone",
+                "--no-checkout",
+                bare.to_string_lossy().as_ref(),
+                checkout.to_string_lossy().as_ref(),
+            ],
+        )?;
+        fixture_git(&checkout, &["remote", "set-url", "origin", &repository_url])?;
+        let bare_slashes = bare.to_string_lossy().replace('\\', "/");
+        let bare_url = if bare_slashes.starts_with('/') {
+            format!("file://{bare_slashes}")
+        } else {
+            format!("file:///{bare_slashes}")
+        };
+        fixture_git(
+            &checkout,
+            &[
+                "config",
+                &format!("url.{bare_url}.insteadOf"),
+                &repository_url,
+            ],
+        )?;
+        Ok((repository_url, checkpoint, seed, checkout))
     }
 
     #[test]
@@ -2569,7 +2957,18 @@ mod tests {
             "familiarId": "sage",
             "harness": "codex",
             "model": "openai/gpt-5.6",
-            "workspace": {"root": "C:/work/project", "projectName": "Cave", "checkpoint": "abc123"},
+            "workspace": {
+                "root": ".",
+                "projectName": "Cave",
+                "repositoryUrl": "https://github.com/OpenCoven/coven-cave",
+                "checkpoint": "abc123",
+                "subdirectory": "packages/app",
+                "overlay": {
+                    "patchBase64": "ZGlmZg==",
+                    "digest": "sha256-abc123",
+                    "untrackedFiles": [{"path": "packages/app/new.txt", "dataBase64": "bmV3", "executable": false}]
+                }
+            },
             "prompt": "Continue the existing conversation on this executor.",
             "contextMessages": [
                 {"role": "user", "text": "Earlier question"},
@@ -2599,10 +2998,14 @@ mod tests {
         let spec: Value = serde_json::from_str(&spec_json)?;
         assert_eq!(spec["command"], json!(["coven:fleet-chat-turn"]));
         assert_eq!(spec["context"]["schemaVersion"], "coven.fleet.chat-turn.v1");
-        assert_eq!(spec["context"]["workspace"]["root"], "C:/work/project");
+        assert_eq!(spec["context"]["workspace"]["root"], ".");
+        assert_eq!(
+            spec["context"]["workspace"]["overlay"]["untrackedFiles"][0]["path"],
+            "packages/app/new.txt"
+        );
         assert_eq!(
             spec["requiredCapabilities"],
-            json!(["shell", "fleet-chat-turn-v1"])
+            json!(["shell", "fleet-chat-turn-v1", "fleet-managed-workspace-v1"])
         );
         Ok(())
     }
@@ -2702,22 +3105,10 @@ mod tests {
             "UPDATE fleet_trusted_nodes SET executor_availability='available', workspace_inventory_json='[]' WHERE node_id='node_windows'",
             [],
         )?;
-        let missing_workspace = body(queue_remote_turn_job(hub.path(), Some(&request))?);
-        assert_eq!(
-            missing_workspace["error"]["code"],
-            "executor_workspace_missing"
-        );
-        open(hub.path())?.execute(
-            "UPDATE fleet_trusted_nodes SET workspace_inventory_json=?1 WHERE node_id='node_windows'",
-            [r#"[{"projectName":"Cave","checkpoint":"different"}]"#],
-        )?;
-        let mismatched_checkpoint = body(queue_remote_turn_job(hub.path(), Some(&request))?);
-        assert_eq!(
-            mismatched_checkpoint["error"]["code"],
-            "executor_workspace_checkpoint_mismatch"
-        );
+        let managed_workspace = body(queue_remote_turn_job(hub.path(), Some(&request))?);
+        assert_eq!(managed_workspace["state"], "queued");
         let jobs = body(list_fleet_jobs(hub.path())?);
-        assert!(jobs["jobs"].as_array().unwrap().is_empty());
+        assert_eq!(jobs["jobs"].as_array().unwrap().len(), 1);
         Ok(())
     }
 
@@ -2890,6 +3281,47 @@ mod tests {
             ),
         )?);
         assert_eq!(invalid["error"]["code"], "invalid_remote_turn");
+        let dot_id = body(queue_remote_turn_job(
+            home.path(),
+            Some(
+                &json!({
+                    "turnId": ".",
+                    "targetNodeId": "node_windows",
+                    "familiarId": "sage",
+                    "harness": "codex",
+                    "workspace": {"root": "."},
+                    "prompt": "hello",
+                    "permissionMode": "full"
+                })
+                .to_string(),
+            ),
+        )?);
+        assert_eq!(dot_id["error"]["code"], "invalid_remote_turn");
+        let unsafe_overlay = body(queue_remote_turn_job(
+            home.path(),
+            Some(
+                &json!({
+                    "turnId": "turn_overlay",
+                    "targetNodeId": "node_windows",
+                    "familiarId": "sage",
+                    "harness": "codex",
+                    "workspace": {
+                        "root": ".",
+                        "repositoryUrl": "https://github.com/OpenCoven/coven-cave",
+                        "checkpoint": "abc123",
+                        "overlay": {
+                            "patchBase64": "",
+                            "digest": "sha256-abc123",
+                            "untrackedFiles": [{"path": "../escape", "dataBase64": "eA=="}]
+                        }
+                    },
+                    "prompt": "hello",
+                    "permissionMode": "full"
+                })
+                .to_string(),
+            ),
+        )?);
+        assert_eq!(unsafe_overlay["error"]["code"], "invalid_remote_turn");
         Ok(())
     }
 
@@ -3049,12 +3481,29 @@ mod tests {
     #[test]
     fn remote_turn_preparation_materializes_bounded_portable_context() -> Result<()> {
         let home = tempfile::tempdir()?;
-        let workspace = tempfile::tempdir()?;
+        let (repository_url, checkpoint, seed, checkout) = managed_workspace_fixture(home.path())?;
+        fs::write(seed.join("packages/app/tracked.txt"), "changed\n")?;
+        let patch = Command::new("git")
+            .args(["diff", "--binary", "--full-index", "HEAD"])
+            .current_dir(&seed)
+            .output()?;
+        anyhow::ensure!(patch.status.success());
+        let untracked = b"portable\n";
+        let mut overlay_digest = Sha256::new();
+        overlay_digest.update(&patch.stdout);
+        overlay_digest.update([0]);
+        overlay_digest.update(b"packages/app/untracked.txt");
+        overlay_digest.update([0]);
+        overlay_digest.update(untracked);
         let spec = crate::executor_node::ExecutorJob {
             protocol_version: crate::executor_node::EXECUTOR_PROTOCOL_VERSION.to_string(),
             job_id: "fleetturn_prepare".to_string(),
             hub_id: Some("hub_mac".to_string()),
-            required_capabilities: vec!["shell".to_string(), "fleet-chat-turn-v1".to_string()],
+            required_capabilities: vec![
+                "shell".to_string(),
+                "fleet-chat-turn-v1".to_string(),
+                "fleet-managed-workspace-v1".to_string(),
+            ],
             command: vec!["coven:fleet-chat-turn".to_string()],
             cwd: None,
             env: Default::default(),
@@ -3066,7 +3515,20 @@ mod tests {
                 "turnId": "turn_prepare",
                 "familiarId": "sage",
                 "harness": "codex",
-                "workspace": {"root": workspace.path()},
+                "workspace": {
+                    "root": ".",
+                    "repositoryUrl": repository_url,
+                    "checkpoint": checkpoint,
+                    "subdirectory": "packages/app",
+                    "overlay": {
+                        "patchBase64": base64::engine::general_purpose::STANDARD.encode(&patch.stdout),
+                        "digest": format!("sha256-{}", hex_bytes(&overlay_digest.finalize())),
+                        "untrackedFiles": [{
+                            "path": "packages/app/untracked.txt",
+                            "dataBase64": base64::engine::general_purpose::STANDARD.encode(untracked)
+                        }]
+                    }
+                },
                 "prompt": "Current question",
                 "contextMessages": [{"role": "assistant", "text": "Prior answer"}],
                 "attachments": [{
@@ -3081,7 +3543,21 @@ mod tests {
             .map_err(|response| anyhow::anyhow!(response.body))?;
         assert_eq!(
             execution.cwd.as_deref(),
-            Some(workspace.path().to_string_lossy().as_ref())
+            Some(
+                checkout
+                    .join("packages/app")
+                    .canonicalize()?
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert_eq!(
+            fs::read_to_string(checkout.join("packages/app/tracked.txt"))?,
+            "changed\n"
+        );
+        assert_eq!(
+            fs::read(checkout.join("packages/app/untracked.txt"))?,
+            untracked
         );
         assert!(execution
             .command
@@ -3091,6 +3567,14 @@ mod tests {
             .command
             .iter()
             .any(|arg| arg.contains("Current question")));
+        assert!(!execution.command.iter().any(|arg| arg == "--familiar"));
+        assert_eq!(
+            execution
+                .context
+                .as_ref()
+                .and_then(|value| value["familiarId"].as_str()),
+            Some("sage")
+        );
         let files = fs::read_dir(&attachment_root)?.collect::<std::io::Result<Vec<_>>>()?;
         assert_eq!(files.len(), 1);
         assert_eq!(fs::read(files[0].path())?, b"hello");
@@ -3104,14 +3588,16 @@ mod tests {
         let home = tempfile::tempdir()?;
         configure_local_role(
             home.path(),
-            Some(r#"{"role":"executor","capabilities":["shell","fleet-chat-turn-v1"]}"#),
+            Some(
+                r#"{"role":"executor","capabilities":["shell","fleet-chat-turn-v1","fleet-managed-workspace-v1"]}"#,
+            ),
         )?;
         configure_local_sharing(home.path(), Some(r#"{"enabled":true}"#))?;
         local_lifecycle(home.path(), "start", None)?;
         let spec = json!({
             "protocolVersion": crate::executor_node::EXECUTOR_PROTOCOL_VERSION,
             "jobId": "fleetturn_replay",
-            "requiredCapabilities": ["shell", "fleet-chat-turn-v1"],
+            "requiredCapabilities": ["shell", "fleet-chat-turn-v1", "fleet-managed-workspace-v1"],
             "command": ["coven:fleet-chat-turn"],
             "env": {},
             "context": {"kind": "fleet-chat-turn"}

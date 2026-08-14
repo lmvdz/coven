@@ -2337,7 +2337,7 @@ fn daemon_status_from_health_socket(socket: &str) -> Result<Option<DaemonStatus>
 // thread indefinitely (slowloris) or force a huge allocation by claiming a
 // large body.
 pub const TCP_IO_TIMEOUT: Duration = Duration::from_secs(30);
-pub const MAX_TCP_BODY_BYTES: usize = 1024 * 1024;
+pub const MAX_TCP_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 /// Body cap for Unix socket and Windows named pipe transports.
 /// These transports are local-only, so the risk is lower than TCP, but a

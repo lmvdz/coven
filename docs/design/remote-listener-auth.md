@@ -53,8 +53,11 @@ What already exists — the remote listener composes with all of it:
   guard (`HostGuard::Loopback`), never the bind.
 - **Browser-attack defenses on TCP**: exact-match Host allowlist plus Origin
   check defend against CSRF and DNS rebinding; `TCP_IO_TIMEOUT` (30 s
-  read/write) and `MAX_TCP_BODY_BYTES` (1 MiB) cap slowloris and allocation
-  abuse. The remote listener inherits all of these.
+  read/write) and `MAX_TCP_BODY_BYTES` (4 MiB) cap slowloris and allocation
+  abuse. The larger body ceiling admits bounded Fleet turn envelopes containing
+  canonical context, attachments, and portable workspace overlays; each binary
+  component also has a stricter 768 KiB decoded limit. The remote listener
+  inherits all of these limits.
 - **Fail-closed local trust anchor**: `ensure_private_coven_home` refuses a
   `COVEN_HOME` not owned by the current uid (`check_owned_by_current_user`)
   before binding the socket. The remote listener's key material lives under
