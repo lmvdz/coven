@@ -107,6 +107,14 @@ fn open(home: &Path) -> Result<Connection> {
         "ALTER TABLE fleet_trusted_nodes ADD COLUMN display_name TEXT",
         [],
     );
+    let _ = conn.execute(
+        "ALTER TABLE fleet_trusted_nodes ADD COLUMN executor_availability TEXT NOT NULL DEFAULT 'unknown'",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE fleet_trusted_nodes ADD COLUMN workspace_inventory_json TEXT",
+        [],
+    );
     Ok(conn)
 }
 
@@ -1020,8 +1028,8 @@ pub fn revoke(home: &Path, node_id: &str) -> Result<ApiResponse> {
 
 pub fn list_trusted_nodes(home: &Path) -> Result<ApiResponse> {
     let conn = open(home)?;
-    let mut statement = conn.prepare("SELECT node_id, enrolled_at, last_seen_at, revoked_at, display_name, capabilities_json FROM fleet_trusted_nodes ORDER BY enrolled_at")?;
-    let nodes = statement.query_map([], |r| Ok(json!({"nodeId": r.get::<_, String>(0)?, "enrolledAt": r.get::<_, String>(1)?, "lastSeenAt": r.get::<_, String>(2)?, "revokedAt": r.get::<_, Option<String>>(3)?, "displayName": r.get::<_, Option<String>>(4)?, "capabilities": serde_json::from_str::<Vec<String>>(&r.get::<_, String>(5)?).unwrap_or_default()})))?.collect::<rusqlite::Result<Vec<Value>>>()?;
+    let mut statement = conn.prepare("SELECT node_id, enrolled_at, last_seen_at, revoked_at, display_name, capabilities_json, executor_availability FROM fleet_trusted_nodes ORDER BY enrolled_at")?;
+    let nodes = statement.query_map([], |r| Ok(json!({"nodeId": r.get::<_, String>(0)?, "enrolledAt": r.get::<_, String>(1)?, "lastSeenAt": r.get::<_, String>(2)?, "revokedAt": r.get::<_, Option<String>>(3)?, "displayName": r.get::<_, Option<String>>(4)?, "capabilities": serde_json::from_str::<Vec<String>>(&r.get::<_, String>(5)?).unwrap_or_default(), "executorAvailability": r.get::<_, String>(6)?})))?.collect::<rusqlite::Result<Vec<Value>>>()?;
     json_response(200, &json!({ "nodes": nodes }))
 }
 
@@ -1176,12 +1184,14 @@ pub fn queue_remote_turn_job(home: &Path, body: Option<&str>) -> Result<ApiRespo
         return api_error(400, "invalid_remote_turn", message, None);
     }
     let conn = open(home)?;
-    let trusted: Option<(String, String)> = conn.query_row(
-        "SELECT last_seen_at, capabilities_json FROM fleet_trusted_nodes WHERE node_id=?1 AND revoked_at IS NULL",
+    let trusted: Option<(String, String, String, Option<String>)> = conn.query_row(
+        "SELECT last_seen_at, capabilities_json, executor_availability, workspace_inventory_json FROM fleet_trusted_nodes WHERE node_id=?1 AND revoked_at IS NULL",
         [&request.target_node_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     ).optional()?;
-    let Some((last_seen_at, capabilities_json)) = trusted else {
+    let Some((last_seen_at, capabilities_json, executor_availability, workspace_inventory_json)) =
+        trusted
+    else {
         return api_error(
             404,
             "node_untrusted",
@@ -1213,6 +1223,84 @@ pub fn queue_remote_turn_job(home: &Path, body: Option<&str>) -> Result<ApiRespo
             "Update Coven on the selected Fleet executor, then let it reconnect.",
             Some(json!({"requiredCapability": "fleet-chat-turn-v1"})),
         );
+    }
+    let unavailable = match executor_availability.as_str() {
+        "available" | "unknown" => None,
+        "draining" => Some((
+            "executor_draining",
+            "The selected Fleet executor is draining. Resume it before dispatching another turn.",
+        )),
+        "unshared" => Some((
+            "executor_unshared",
+            "The selected Fleet executor is not shared. Enable executor sharing on that device.",
+        )),
+        "stopped" => Some((
+            "executor_stopped",
+            "The selected Fleet executor is stopped. Start it on that device before retrying.",
+        )),
+        "not-executor" => Some((
+            "executor_unavailable",
+            "The selected Fleet device is not configured as an executor.",
+        )),
+        _ => Some((
+            "executor_unavailable",
+            "The selected Fleet executor is not accepting work.",
+        )),
+    };
+    if let Some((code, message)) = unavailable {
+        return api_error(
+            409,
+            code,
+            message,
+            Some(json!({"nodeId": request.target_node_id, "availability": executor_availability})),
+        );
+    }
+    let Some(workspace_inventory_json) = workspace_inventory_json else {
+        return api_error(
+            409,
+            "executor_workspace_inventory_unknown",
+            "Refresh Cave on the selected Fleet executor so it can advertise registered workspaces.",
+            Some(json!({"nodeId": request.target_node_id})),
+        );
+    };
+    let inventory: Vec<FleetWorkspaceAdvertisement> =
+        serde_json::from_str(&workspace_inventory_json).unwrap_or_default();
+    let matches: Vec<&FleetWorkspaceAdvertisement> =
+        if let Some(repository_url) = request.workspace.repository_url.as_deref() {
+            inventory
+                .iter()
+                .filter(|workspace| workspace.repository_url.as_deref() == Some(repository_url))
+                .collect()
+        } else if let Some(project_name) = request.workspace.project_name.as_deref() {
+            inventory
+                .iter()
+                .filter(|workspace| {
+                    workspace
+                        .project_name
+                        .as_deref()
+                        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(project_name))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+    if matches.len() != 1 {
+        return api_error(
+            409,
+            "executor_workspace_missing",
+            "The selected Fleet executor does not have this project registered uniquely. Add the project there, then retry.",
+            Some(json!({"nodeId": request.target_node_id, "projectName": request.workspace.project_name, "repositoryUrl": request.workspace.repository_url})),
+        );
+    }
+    if let Some(checkpoint) = request.workspace.checkpoint.as_deref() {
+        if matches[0].checkpoint.as_deref() != Some(checkpoint) {
+            return api_error(
+                409,
+                "executor_workspace_checkpoint_mismatch",
+                "The executor project is on a different revision. Update it to the hub checkpoint, then retry.",
+                Some(json!({"nodeId": request.target_node_id, "expectedCheckpoint": checkpoint, "actualCheckpoint": matches[0].checkpoint})),
+            );
+        }
     }
     let job_id = format!("fleetturn_{}", request.turn_id);
     let existing: Option<(String, String)> = conn
@@ -1391,6 +1479,42 @@ struct AuthenticatedFleetRequest {
     capabilities: Vec<String>,
     #[serde(default)]
     display_name: Option<String>,
+    #[serde(default)]
+    accepting_jobs: Option<bool>,
+    #[serde(default)]
+    availability_reason: Option<String>,
+    #[serde(default)]
+    workspaces: Option<Vec<FleetWorkspaceAdvertisement>>,
+}
+
+#[derive(Clone, Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FleetWorkspaceAdvertisement {
+    #[serde(default)]
+    project_name: Option<String>,
+    #[serde(default)]
+    repository_url: Option<String>,
+    #[serde(default)]
+    checkpoint: Option<String>,
+}
+
+fn valid_workspace_inventory(inventory: &[FleetWorkspaceAdvertisement]) -> bool {
+    inventory.len() <= 128
+        && inventory.iter().all(|workspace| {
+            (workspace.project_name.is_some() || workspace.repository_url.is_some())
+                && workspace
+                    .project_name
+                    .as_deref()
+                    .is_none_or(bounded_remote_field)
+                && workspace
+                    .repository_url
+                    .as_deref()
+                    .is_none_or(bounded_remote_field)
+                && workspace
+                    .checkpoint
+                    .as_deref()
+                    .is_none_or(valid_remote_token)
+        })
 }
 
 fn authenticate_fleet_request(
@@ -1420,14 +1544,34 @@ pub fn claim_fleet_job(home: &Path, body: Option<&str>) -> Result<ApiResponse> {
     advertised.sort();
     advertised.dedup();
     advertised.retain(|value| valid_remote_identifier(value));
+    if request
+        .workspaces
+        .as_deref()
+        .is_some_and(|inventory| !valid_workspace_inventory(inventory))
+    {
+        return api_error(
+            400,
+            "invalid_workspace_inventory",
+            "Fleet workspace inventory is invalid.",
+            None,
+        );
+    }
     conn.execute(
-        "UPDATE fleet_trusted_nodes SET capabilities_json=?1, display_name=COALESCE(?2, display_name) WHERE node_id=?3",
+        "UPDATE fleet_trusted_nodes SET capabilities_json=?1, display_name=COALESCE(?2, display_name), executor_availability=?3, workspace_inventory_json=COALESCE(?4, workspace_inventory_json) WHERE node_id=?5",
         params![
             serde_json::to_string(&advertised)?,
             request.display_name.as_deref().filter(|value| bounded_remote_field(value)),
+            request.availability_reason.as_deref().filter(|value| matches!(*value, "available" | "draining" | "unshared" | "stopped" | "not-executor")).unwrap_or(if request.accepting_jobs == Some(false) { "unavailable" } else { "available" }),
+            request.workspaces.as_ref().map(serde_json::to_string).transpose()?,
             request.node_id
         ],
     )?;
+    if request.accepting_jobs == Some(false) {
+        return json_response(
+            200,
+            &json!({"job": null, "availability": request.availability_reason.unwrap_or_else(|| "unavailable".to_string())}),
+        );
+    }
     let tx = conn.transaction()?;
     let queued: Option<(String, String)> = tx
         .query_row(
@@ -1531,6 +1675,9 @@ pub fn append_authenticated_fleet_job_events(
         proof: request.proof,
         capabilities: Vec::new(),
         display_name: None,
+        accepting_jobs: None,
+        availability_reason: None,
+        workspaces: None,
     };
     if let Some(response) = authenticate_fleet_request(home, &auth)? {
         return Ok(response);
@@ -1595,6 +1742,9 @@ pub fn authenticated_fleet_job_status(home: &Path, body: Option<&str>) -> Result
         proof: request.proof,
         capabilities: Vec::new(),
         display_name: None,
+        accepting_jobs: None,
+        availability_reason: None,
+        workspaces: None,
     };
     if let Some(response) = authenticate_fleet_request(home, &auth)? {
         return Ok(response);
@@ -1623,6 +1773,9 @@ pub fn complete_fleet_job(home: &Path, body: Option<&str>) -> Result<ApiResponse
         proof: request.proof.clone(),
         capabilities: Vec::new(),
         display_name: None,
+        accepting_jobs: None,
+        availability_reason: None,
+        workspaces: None,
     };
     if let Some(response) = authenticate_fleet_request(home, &auth)? {
         return Ok(response);
@@ -2168,10 +2321,11 @@ mod tests {
 
     fn advertise_remote_turn_capability(home: &Path, node_id: &str) -> Result<()> {
         open(home)?.execute(
-            "UPDATE fleet_trusted_nodes SET capabilities_json=?1, last_seen_at=?2 WHERE node_id=?3",
+            "UPDATE fleet_trusted_nodes SET capabilities_json=?1, last_seen_at=?2, workspace_inventory_json=?3 WHERE node_id=?4",
             params![
                 r#"["shell","fleet-chat-turn-v1"]"#,
                 Utc::now().to_rfc3339(),
+                r#"[{"projectName":"Cave","checkpoint":"abc123"}]"#,
                 node_id
             ],
         )?;
@@ -2415,7 +2569,7 @@ mod tests {
             "familiarId": "sage",
             "harness": "codex",
             "model": "openai/gpt-5.6",
-            "workspace": {"root": "C:/work/project", "checkpoint": "abc123"},
+            "workspace": {"root": "C:/work/project", "projectName": "Cave", "checkpoint": "abc123"},
             "prompt": "Continue the existing conversation on this executor.",
             "contextMessages": [
                 {"role": "user", "text": "Earlier question"},
@@ -2475,7 +2629,7 @@ mod tests {
                 "targetNodeId": "node_windows",
                 "familiarId": "sage",
                 "harness": "codex",
-                "workspace": {"root": "C:/work/project"},
+                "workspace": {"root": "C:/work/project", "projectName": "Cave"},
                 "prompt": prompt,
                 "permissionMode": "full"
             })
@@ -2517,7 +2671,7 @@ mod tests {
             "targetNodeId": "node_windows",
             "familiarId": "sage",
             "harness": "codex",
-            "workspace": {"root": "C:/work/project"},
+            "workspace": {"root": "C:/work/project", "projectName": "Cave", "checkpoint": "abc123"},
             "prompt": "hello",
             "permissionMode": "read"
         })
@@ -2531,8 +2685,104 @@ mod tests {
         )?;
         let offline = body(queue_remote_turn_job(hub.path(), Some(&request))?);
         assert_eq!(offline["error"]["code"], "executor_offline");
+        for (availability, expected) in [
+            ("draining", "executor_draining"),
+            ("unshared", "executor_unshared"),
+            ("stopped", "executor_stopped"),
+            ("not-executor", "executor_unavailable"),
+        ] {
+            open(hub.path())?.execute(
+                "UPDATE fleet_trusted_nodes SET last_seen_at=?1, executor_availability=?2 WHERE node_id='node_windows'",
+                params![Utc::now().to_rfc3339(), availability],
+            )?;
+            let unavailable = body(queue_remote_turn_job(hub.path(), Some(&request))?);
+            assert_eq!(unavailable["error"]["code"], expected);
+        }
+        open(hub.path())?.execute(
+            "UPDATE fleet_trusted_nodes SET executor_availability='available', workspace_inventory_json='[]' WHERE node_id='node_windows'",
+            [],
+        )?;
+        let missing_workspace = body(queue_remote_turn_job(hub.path(), Some(&request))?);
+        assert_eq!(
+            missing_workspace["error"]["code"],
+            "executor_workspace_missing"
+        );
+        open(hub.path())?.execute(
+            "UPDATE fleet_trusted_nodes SET workspace_inventory_json=?1 WHERE node_id='node_windows'",
+            [r#"[{"projectName":"Cave","checkpoint":"different"}]"#],
+        )?;
+        let mismatched_checkpoint = body(queue_remote_turn_job(hub.path(), Some(&request))?);
+        assert_eq!(
+            mismatched_checkpoint["error"]["code"],
+            "executor_workspace_checkpoint_mismatch"
+        );
         let jobs = body(list_fleet_jobs(hub.path())?);
         assert!(jobs["jobs"].as_array().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_executor_heartbeat_updates_state_without_claiming_work() -> Result<()> {
+        let hub = tempfile::tempdir()?;
+        let enrollment = body(create_enrollment(hub.path(), Some("{}"))?);
+        let enrolled = body(enroll(
+            hub.path(),
+            Some(
+                &json!({
+                    "nodeId": "node_windows",
+                    "enrollmentCredential": enrollment["credential"],
+                    "protocolVersion": PROTOCOL
+                })
+                .to_string(),
+            ),
+        )?);
+        let credential = enrolled["nodeCredential"].as_str().unwrap();
+        advertise_remote_turn_capability(hub.path(), "node_windows")?;
+        let queued = body(queue_remote_turn_job(
+            hub.path(),
+            Some(
+                &json!({
+                    "turnId": "turn_waiting",
+                    "targetNodeId": "node_windows",
+                    "familiarId": "sage",
+                    "harness": "codex",
+                    "workspace": {"root": "C:/work/project", "projectName": "Cave"},
+                    "prompt": "wait for sharing",
+                    "permissionMode": "read"
+                })
+                .to_string(),
+            ),
+        )?);
+        let challenge = body(create_challenge(
+            hub.path(),
+            Some(r#"{"nodeId":"node_windows"}"#),
+        )?);
+        let nonce = challenge["nonce"].as_str().unwrap();
+        let claim = body(claim_fleet_job(
+            hub.path(),
+            Some(
+                &json!({
+                    "nodeId": "node_windows",
+                    "nonce": nonce,
+                    "proof": proof(credential, nonce),
+                    "capabilities": ["shell", "fleet-chat-turn-v1"],
+                    "acceptingJobs": false,
+                    "availabilityReason": "unshared"
+                })
+                .to_string(),
+            ),
+        )?);
+        assert!(claim["job"].is_null());
+        assert_eq!(claim["availability"], "unshared");
+        assert_eq!(
+            body(list_fleet_jobs(hub.path())?)["jobs"][0]["state"],
+            "queued"
+        );
+        assert_eq!(
+            body(list_trusted_nodes(hub.path())?)["nodes"][0]["executorAvailability"],
+            "unshared"
+        );
+        assert_eq!(queued["state"], "queued");
         Ok(())
     }
 
@@ -2561,7 +2811,7 @@ mod tests {
                     "targetNodeId": "node_windows",
                     "familiarId": "sage",
                     "harness": "codex",
-                    "workspace": {"root": "C:/work/project"},
+                    "workspace": {"root": "C:/work/project", "projectName": "Cave"},
                     "prompt": "hello",
                     "permissionMode": "read"
                 })
@@ -2632,7 +2882,7 @@ mod tests {
                     "targetNodeId": "node_windows",
                     "familiarId": "sage",
                     "harness": "codex",
-                    "workspace": {"root": "C:/work/project"},
+                    "workspace": {"root": "C:/work/project", "projectName": "Cave"},
                     "prompt": "hello",
                     "permissionMode": "full"
                 })
