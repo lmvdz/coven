@@ -208,17 +208,26 @@ fn local_node_response(node: &LocalNode) -> Value {
         _ if role_has_executor(&node.role) && !node.executor_shared => "enable-sharing",
         _ => "none",
     };
+    let available_harnesses = available_fleet_harnesses_with(crate::harness::harness_available);
     json!({
         "deviceId": node.device_id,
         "role": node.role,
         "lifecycle": node.lifecycle,
         "executorShared": node.executor_shared,
         "capabilities": capabilities,
+        "availableHarnesses": available_harnesses,
         "acceptingJobs": accepting_jobs,
         "generation": node.generation,
         "updatedAt": node.updated_at,
         "nextAction": next_action
     })
+}
+
+fn available_fleet_harnesses_with(mut available: impl FnMut(&str) -> bool) -> Vec<&'static str> {
+    ["codex", "claude", "copilot"]
+        .into_iter()
+        .filter(|harness| available(harness))
+        .collect()
 }
 
 pub fn local_node_status(home: &Path) -> Result<ApiResponse> {
@@ -1285,6 +1294,20 @@ pub fn queue_remote_turn_job(home: &Path, body: Option<&str>) -> Result<ApiRespo
             "executor_incompatible",
             "Update Coven on the selected Fleet executor, then let it reconnect.",
             Some(json!({"requiredCapability": "fleet-managed-workspace-v1"})),
+        );
+    }
+    if capabilities
+        .iter()
+        .any(|value| value == "fleet-runtime-inventory-v1")
+        && !capabilities
+            .iter()
+            .any(|value| value == &format!("harness:{}", request.harness))
+    {
+        return api_error(
+            409,
+            "executor_harness_unavailable",
+            "The selected Fleet executor does not currently detect this conversation's runtime. Open runtime diagnostics on that device, then retry after it reconnects.",
+            Some(json!({"nodeId": request.target_node_id, "harness": request.harness})),
         );
     }
     let unavailable = match executor_availability.as_str() {
@@ -2541,9 +2564,26 @@ pub fn run_local_fleet_job(home: &Path, body: Option<&str>) -> Result<ApiRespons
              (job_id, spec_hash, state, started_at) VALUES (?1, ?2, 'running', ?3)",
             params![spec.job_id, spec_hash, Utc::now().to_rfc3339()],
         )?;
+        let event_sequence = Arc::new(AtomicI64::new(0));
+        append_local_fleet_progress_event(
+            home,
+            &spec.job_id,
+            &event_sequence,
+            "workspace",
+            "Preparing workspace on executor",
+            "running",
+        );
         let (execution, attachment_root) = match remote_turn_execution_job(home, &spec) {
             Ok(value) => value,
             Err(response) => {
+                append_local_fleet_progress_event(
+                    home,
+                    &spec.job_id,
+                    &event_sequence,
+                    "workspace",
+                    "Workspace preparation failed",
+                    "error",
+                );
                 conn.execute(
                     "UPDATE fleet_execution_receipts SET state='rejected', completed_at=?1
                      WHERE job_id=?2",
@@ -2552,9 +2592,25 @@ pub fn run_local_fleet_job(home: &Path, body: Option<&str>) -> Result<ApiRespons
                 return Ok(response);
             }
         };
-        let event_sequence = Arc::new(AtomicI64::new(0));
+        append_local_fleet_progress_event(
+            home,
+            &spec.job_id,
+            &event_sequence,
+            "workspace",
+            "Workspace ready",
+            "done",
+        );
+        append_local_fleet_progress_event(
+            home,
+            &spec.job_id,
+            &event_sequence,
+            "runtime",
+            "Launching selected runtime on executor",
+            "running",
+        );
         let event_home = home.to_path_buf();
         let event_job_id = spec.job_id.clone();
+        let output_event_sequence = Arc::clone(&event_sequence);
         let result = crate::executor_node::run_job_observed(
             &execution,
             || {
@@ -2566,7 +2622,7 @@ pub fn run_local_fleet_job(home: &Path, body: Option<&str>) -> Result<ApiRespons
                 .unwrap_or(false)
             },
             move |chunk| {
-                let sequence = event_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+                let sequence = output_event_sequence.fetch_add(1, Ordering::Relaxed) + 1;
                 let encoded = base64::engine::general_purpose::STANDARD.encode(chunk);
                 if let Ok(event_conn) = open(&event_home) {
                     let _ = event_conn.execute(
@@ -2579,6 +2635,20 @@ pub fn run_local_fleet_job(home: &Path, body: Option<&str>) -> Result<ApiRespons
         );
         let _ = fs::remove_dir_all(attachment_root);
         let result = serde_json::to_value(result)?;
+        let runtime_succeeded = result.get("status").and_then(Value::as_str)
+            == Some(crate::executor_node::RESULT_STATUS_COMPLETED);
+        append_local_fleet_progress_event(
+            home,
+            &spec.job_id,
+            &event_sequence,
+            "runtime",
+            if runtime_succeeded {
+                "Executor response ready"
+            } else {
+                "Executor runtime stopped"
+            },
+            if runtime_succeeded { "done" } else { "error" },
+        );
         let receipt_state = if result.get("status").and_then(Value::as_str)
             == Some(crate::executor_node::RESULT_STATUS_CANCELLED)
         {
@@ -2600,6 +2670,34 @@ pub fn run_local_fleet_job(home: &Path, body: Option<&str>) -> Result<ApiRespons
     }
     let result = crate::executor_node::run_job(&spec);
     json_response(200, &serde_json::to_value(result)?)
+}
+
+fn append_local_fleet_progress_event(
+    home: &Path,
+    job_id: &str,
+    sequence: &AtomicI64,
+    id: &str,
+    label: &str,
+    status: &str,
+) {
+    let payload = json!({
+        "type": "fleet_progress",
+        "schemaVersion": "coven.fleet.progress.v1",
+        "id": id,
+        "label": label,
+        "status": status,
+    });
+    let mut bytes = payload.to_string().into_bytes();
+    bytes.push(b'\n');
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let event_sequence = sequence.fetch_add(1, Ordering::Relaxed) + 1;
+    if let Ok(conn) = open(home) {
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO fleet_job_events
+             (job_id, sequence, chunk_base64, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![job_id, event_sequence, encoded, Utc::now().to_rfc3339()],
+        );
+    }
 }
 
 pub fn cancel_local_fleet_execution(home: &Path, job_id: &str) -> Result<ApiResponse> {
@@ -2645,6 +2743,48 @@ fn parse<T: for<'de> Deserialize<'de>>(body: Option<&str>) -> std::result::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fleet_runtime_inventory_advertises_only_detected_harnesses() {
+        let available = available_fleet_harnesses_with(|harness| harness != "claude");
+        assert_eq!(available, vec!["codex", "copilot"]);
+    }
+
+    #[test]
+    fn local_fleet_progress_events_are_ordered_secret_free_jsonl() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let sequence = AtomicI64::new(0);
+        append_local_fleet_progress_event(
+            home.path(),
+            "fleetturn_progress",
+            &sequence,
+            "workspace",
+            "Workspace ready",
+            "done",
+        );
+        append_local_fleet_progress_event(
+            home.path(),
+            "fleetturn_progress",
+            &sequence,
+            "runtime",
+            "Launching selected runtime on executor",
+            "running",
+        );
+        let events = body(list_local_fleet_job_events(
+            home.path(),
+            "fleetturn_progress",
+        )?);
+        assert_eq!(events["events"][0]["sequence"], 1);
+        assert_eq!(events["events"][1]["sequence"], 2);
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(events["events"][0]["chunkBase64"].as_str().unwrap())?;
+        let progress: Value = serde_json::from_slice(&decoded)?;
+        assert_eq!(progress["schemaVersion"], "coven.fleet.progress.v1");
+        assert_eq!(progress["label"], "Workspace ready");
+        assert!(progress.get("path").is_none());
+        assert!(progress.get("credential").is_none());
+        Ok(())
+    }
 
     fn body(response: ApiResponse) -> Value {
         serde_json::from_str(&response.body).unwrap()
@@ -3085,6 +3225,19 @@ mod tests {
         let incompatible = body(queue_remote_turn_job(hub.path(), Some(&request))?);
         assert_eq!(incompatible["error"]["code"], "executor_incompatible");
         advertise_remote_turn_capability(hub.path(), "node_windows")?;
+        open(hub.path())?.execute(
+            "UPDATE fleet_trusted_nodes SET capabilities_json=?1 WHERE node_id='node_windows'",
+            [r#"["shell","fleet-chat-turn-v1","fleet-managed-workspace-v1","fleet-runtime-inventory-v1"]"#],
+        )?;
+        let runtime_missing = body(queue_remote_turn_job(hub.path(), Some(&request))?);
+        assert_eq!(
+            runtime_missing["error"]["code"],
+            "executor_harness_unavailable"
+        );
+        open(hub.path())?.execute(
+            "UPDATE fleet_trusted_nodes SET capabilities_json=?1 WHERE node_id='node_windows'",
+            [r#"["shell","fleet-chat-turn-v1","fleet-managed-workspace-v1","fleet-runtime-inventory-v1","harness:codex"]"#],
+        )?;
         open(hub.path())?.execute(
             "UPDATE fleet_trusted_nodes SET last_seen_at=?1 WHERE node_id='node_windows'",
             [(Utc::now() - Duration::seconds(30)).to_rfc3339()],

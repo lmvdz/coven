@@ -2337,10 +2337,18 @@ fn harness_search_paths() -> Vec<PathBuf> {
     {
         let mut paths = paths;
         // Desktop/startup processes often inherit Windows' system PATH rather
-        // than the interactive shell PATH. npm's per-user global shims live
-        // here by default, so discover them without requiring Cave, Git Bash,
-        // or a login script to mutate the daemon's process environment.
-        append_windows_npm_search_path(&mut paths, env::var_os("APPDATA"));
+        // than the interactive shell PATH. Discover the standard per-user
+        // shim locations without requiring Cave, Git Bash, or a login script
+        // to mutate the daemon's process environment.
+        append_windows_harness_search_paths(
+            &mut paths,
+            env::var_os("APPDATA"),
+            env::var_os("LOCALAPPDATA"),
+            env::var_os("USERPROFILE"),
+            env::var_os("PNPM_HOME"),
+            env::var_os("NVM_SYMLINK"),
+            env::var_os("ProgramFiles"),
+        );
         paths
     }
     #[cfg(not(windows))]
@@ -2350,13 +2358,44 @@ fn harness_search_paths() -> Vec<PathBuf> {
 }
 
 #[cfg(any(windows, test))]
-fn append_windows_npm_search_path(paths: &mut Vec<PathBuf>, app_data: Option<OsString>) {
-    let Some(app_data) = app_data.filter(|value| !value.is_empty()) else {
-        return;
-    };
-    let npm = PathBuf::from(app_data).join("npm");
-    if !paths.iter().any(|candidate| candidate == &npm) {
-        paths.push(npm);
+fn append_windows_harness_search_paths(
+    paths: &mut Vec<PathBuf>,
+    app_data: Option<OsString>,
+    local_app_data: Option<OsString>,
+    user_profile: Option<OsString>,
+    pnpm_home: Option<OsString>,
+    nvm_symlink: Option<OsString>,
+    program_files: Option<OsString>,
+) {
+    let mut candidates = Vec::new();
+    if let Some(value) = app_data.filter(|value| !value.is_empty()) {
+        candidates.push(PathBuf::from(value).join("npm"));
+    }
+    if let Some(value) = local_app_data.filter(|value| !value.is_empty()) {
+        let root = PathBuf::from(value);
+        candidates.push(root.join("pnpm"));
+        candidates.push(root.join("Microsoft").join("WinGet").join("Links"));
+    }
+    if let Some(value) = user_profile.filter(|value| !value.is_empty()) {
+        let root = PathBuf::from(value);
+        candidates.push(root.join(".volta").join("bin"));
+        candidates.push(root.join(".bun").join("bin"));
+        candidates.push(root.join("scoop").join("shims"));
+    }
+    candidates.extend(
+        [pnpm_home, nvm_symlink]
+            .into_iter()
+            .flatten()
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
+    );
+    if let Some(value) = program_files.filter(|value| !value.is_empty()) {
+        candidates.push(PathBuf::from(value).join("nodejs"));
+    }
+    for candidate in candidates {
+        if !paths.iter().any(|existing| existing == &candidate) {
+            paths.push(candidate);
+        }
     }
 }
 
@@ -2653,22 +2692,38 @@ mod tests {
     }
 
     #[test]
-    fn windows_harness_search_adds_the_per_user_npm_shim_directory() {
+    fn windows_harness_search_adds_standard_user_shim_directories_once() {
         let mut paths = vec![PathBuf::from(r"C:\Windows\System32")];
-        append_windows_npm_search_path(
-            &mut paths,
-            Some(OsString::from(r"C:\Users\Lars\AppData\Roaming")),
-        );
-        assert_eq!(
-            paths.last(),
-            Some(&PathBuf::from(r"C:\Users\Lars\AppData\Roaming").join("npm"))
-        );
+        let append = |paths: &mut Vec<PathBuf>| {
+            append_windows_harness_search_paths(
+                paths,
+                Some(OsString::from(r"C:\Users\Example\AppData\Roaming")),
+                Some(OsString::from(r"C:\Users\Example\AppData\Local")),
+                Some(OsString::from(r"C:\Users\Example")),
+                Some(OsString::from(r"C:\Tools\pnpm")),
+                Some(OsString::from(r"C:\Tools\nvm-current")),
+                Some(OsString::from(r"C:\Program Files")),
+            )
+        };
+        append(&mut paths);
+        assert!(paths.contains(&PathBuf::from(r"C:\Users\Example\AppData\Roaming").join("npm")));
+        assert!(paths.contains(&PathBuf::from(r"C:\Users\Example\AppData\Local").join("pnpm")));
+        assert!(paths.contains(
+            &PathBuf::from(r"C:\Users\Example")
+                .join(".volta")
+                .join("bin")
+        ));
+        assert!(paths.contains(&PathBuf::from(r"C:\Tools\pnpm")));
+        assert!(paths.contains(&PathBuf::from(r"C:\Tools\nvm-current")));
+        assert!(paths.contains(&PathBuf::from(r"C:\Program Files").join("nodejs")));
 
-        append_windows_npm_search_path(
-            &mut paths,
-            Some(OsString::from(r"C:\Users\Lars\AppData\Roaming")),
+        let count = paths.len();
+        append(&mut paths);
+        assert_eq!(
+            paths.len(),
+            count,
+            "fallback directories are not duplicated"
         );
-        assert_eq!(paths.len(), 2, "the fallback directory is not duplicated");
     }
 
     #[test]
