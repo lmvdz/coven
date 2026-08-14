@@ -19,9 +19,10 @@
 
 use std::{
     collections::BTreeMap,
+    ffi::OsStr,
     io::{Read, Write},
     path::Path,
-    process::Stdio,
+    process::{Command, Stdio},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -51,7 +52,32 @@ const DISPATCH_TIMEOUT_GRACE_SECONDS: u64 = 30;
 /// Cap captured stdout/stderr so result envelopes stay bounded.
 const MAX_CAPTURED_OUTPUT_BYTES: usize = 1_048_576;
 
+#[cfg(any(windows, test))]
+const WINDOWS_CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 const DEFAULT_EXECUTOR_CAPABILITIES: [&str; 1] = ["shell"];
+
+/// Background executor work must never summon a console window on Windows.
+/// Interactive terminals use the PTY path and do not call this helper.
+pub(crate) fn background_command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(program);
+    configure_background_command(&mut command);
+    command
+}
+
+#[cfg(windows)]
+fn configure_background_command(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(windows_background_creation_flags());
+}
+
+#[cfg(not(windows))]
+fn configure_background_command(_command: &mut Command) {}
+
+#[cfg(any(windows, test))]
+fn windows_background_creation_flags() -> u32 {
+    WINDOWS_CREATE_NO_WINDOW
+}
 
 pub fn is_executor_role(role: &str) -> bool {
     role == ROLE_STATIONARY_EXECUTOR || role == ROLE_COMPUTE_EXECUTOR
@@ -285,7 +311,7 @@ impl ExecutorTransport for SshTransport {
         timeout: Duration,
     ) -> Result<ProcessOutput> {
         let argv = self.argv(protocol_args);
-        let mut command = std::process::Command::new(&argv[0]);
+        let mut command = background_command(&argv[0]);
         command.args(&argv[1..]);
         run_process_with_timeout(&mut command, stdin, timeout, &|| false, None)
             .map(|(output, _)| output)
@@ -311,7 +337,7 @@ impl ExecutorTransport for LocalProcessTransport {
         stdin: Option<&str>,
         timeout: Duration,
     ) -> Result<ProcessOutput> {
-        let mut command = std::process::Command::new(&self.program);
+        let mut command = background_command(&self.program);
         command.args(&self.args);
         command.args(protocol_args);
         run_process_with_timeout(&mut command, stdin, timeout, &|| false, None)
@@ -582,7 +608,7 @@ where
 
     let started = Instant::now();
     let started_at = current_timestamp();
-    let mut command = std::process::Command::new(program);
+    let mut command = background_command(program);
     command.args(&job.command[1..]);
     if let Some(cwd) = &job.cwd {
         command.current_dir(cwd);
@@ -752,7 +778,7 @@ fn kill_process_tree(child: &mut std::process::Child) {
     }
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("taskkill")
+        let _ = background_command("taskkill")
             .args(["/PID", &child.id().to_string(), "/T", "/F"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -796,6 +822,11 @@ fn spawn_capped_reader<R: Read + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_executor_processes_use_no_window_on_windows() {
+        assert_eq!(windows_background_creation_flags(), 0x0800_0000);
+    }
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Mutex,

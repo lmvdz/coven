@@ -9,12 +9,15 @@ use std::{
     fs,
     io::Write,
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     sync::{
         atomic::{AtomicI64, Ordering},
         Arc,
     },
 };
+
+#[cfg(test)]
+use std::process::Command;
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
@@ -1915,7 +1918,7 @@ fn safe_workspace_relative_path(value: &str) -> Option<PathBuf> {
 }
 
 fn git_ok(cwd: &Path, args: &[&str]) -> bool {
-    Command::new("git")
+    crate::executor_node::background_command("git")
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -1926,7 +1929,7 @@ fn git_ok(cwd: &Path, args: &[&str]) -> bool {
 }
 
 fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
+    let output = crate::executor_node::background_command("git")
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -2000,7 +2003,7 @@ fn prepare_remote_turn_workspace(
                 )
             })?;
         }
-        let cloned = Command::new("git")
+        let cloned = crate::executor_node::background_command("git")
             .args(["clone", "--no-checkout", repository_url])
             .arg(&checkout)
             .current_dir(&managed_root)
@@ -2085,7 +2088,7 @@ fn prepare_remote_turn_workspace(
             ));
         }
         if !patch.is_empty() {
-            let mut child = Command::new("git")
+            let mut child = crate::executor_node::background_command("git")
                 .args(["apply", "--binary", "--whitespace=nowarn", "-"])
                 .current_dir(&checkout)
                 .stdin(Stdio::piped())
